@@ -1,24 +1,24 @@
 # Model Overview
 
-### Description:
+## Description:
 SOMA (Unifying Parametric Human Body Models) is a unified framework that decouples identity representation from pose parameterization by mapping any supported parametric body model to a single canonical mesh topology and skeleton, enabling a shared Linear Blend Skinning (LBS) pipeline across all backends. SOMA supports six identity backends (SOMA-shape, SMPL, SMPL-X, MHR, ANNY, and GarmentMeasurements), unified under a canonical mesh topology and SOMA skeleton. 
 
 This model is ready for commercial use. 
 
-### License/Terms of Use:
-SOMA is released under the [Apache 2.0 License](../../LICENSE).
+## License/Terms of Use:
+SOMA is released under the [Apache 2.0 License](../LICENSE).
 
-### Deployment Geography:
+## Deployment Geography:
 Global
 
-### Use Case:
+## Use Case:
 SOMA is intended for use by computer vision researchers, graphics and animation engineers, machine learning engineers, and robotics researchers and companies. Specific use cases include:
 - **Pose estimation and human reconstruction** — unified pose interface enables seamless identity substitution across backends without retraining.
 - **Motion generation and animation** — apply motion capture sequences to any supported identity model using the same axis-angle pose parameterization.
 - **Avatar synthesis and digital humans** — freely mix identity sources with SOMA's pose representation.
 - **Simulation and robotics** — lightweight analytical forward pass enables real-time simulation pipelines with diverse body shapes.
 
-### Expected Release Date:
+## Expected Release Date:
 GitHub: 03/16/2026 <br>
 
 ## Reference(s):
@@ -42,7 +42,7 @@ Optional: shallow pose-dependent corrective MLP (2 hidden layers, ReLU activatio
 
 **Number of model parameters:**
 - Core analytical pipeline: 0 learned parameters (closed-form)
-- Principal Component Analysis (PCA) for SOMA-shape model: 128 principal components × ~18,000 vertices × 3 = ~3.1 × 10⁶ coefficients (pre-fitted, not gradient-trained)
+- Principal Component Analysis (PCA) for SOMA-shape model: 128 principal components x ~18,000 mid-LOD vertices x 3 = ~3.1 x 10^6 coefficients (pre-fitted, not gradient-trained)
 - Optional pose corrective Multilayer Perceptron (MLP) layers: ~1 × 10^8 parameters (if enabled)
 
 ## Computational Load
@@ -73,11 +73,11 @@ Optional: shallow pose-dependent corrective MLP (2 hidden layers, ReLU activatio
 
 **Output Parameters:** Three-Dimensional (3D) <br>
 
-- Posed mesh vertices: `(B, N_h, 3)` where `N_h ≈ 18,095` — world-space vertex positions in **meters**
+- Posed mesh vertices: `(B, N_h, 3)` where `N_h` depends on `lod` (`mid`: 18,056; `low`: 4,505; `xlo`: 612) -- world-space vertex positions in **meters**
 - Joint positions: `(B, 77, 3)` — world-space 3D joint positions in **meters**
-- Rest-shape vertices: `(B, N_h, 3)` in meters (intermediate output, available on request)
+- Rest-shape vertices: `(B, N_h, 3)` in meters, with the same LOD-dependent `N_h` (intermediate output, available on request)
 
-**Other Properties Related to Output:** All outputs are in meters. Vertex count `N_h` is fixed by the SOMA canonical topology (mid-resolution LOD, approximately 18,095 vertices). Joint count is fixed at 77.
+**Other Properties Related to Output:** All outputs are in meters. Body vertex count `N_h` is selected by `SOMALayer(lod=...)`; `low_lod=True` is the legacy alias for `lod="low"`. Joint count is fixed at 77.
 
 Our AI models are designed and/or optimized to run on NVIDIA GPU-accelerated systems. By leveraging NVIDIA's hardware (GPU cores) and software frameworks (CUDA libraries, NVIDIA Warp), the model achieves real-time throughput exceeding 7,000 meshes per second at batch size 128 on an A100 GPU.
 
@@ -101,7 +101,7 @@ Our AI models are designed and/or optimized to run on NVIDIA GPU-accelerated sys
 * Windows (via PyTorch CPU/GPU path) <br>
 
 ## Model Version(s):
-- **SOMA v1.0** — initial public release; includes full-body layer (`SOMALayer`, 77 joints, ~18k vertices) and all six identity backends.
+- **SOMA v1.0** — initial public release; includes full-body layer (`SOMALayer`, 77 joints, mid/low/xlo LODs) and all six identity backends.
 
 ## Training, Testing, and Evaluation Datasets:
 
@@ -126,10 +126,10 @@ Our AI models are designed and/or optimized to run on NVIDIA GPU-accelerated sys
 
 **Dataset License(s):** SizeUSA — commercially licensed (purchased by NVIDIA); TripleGangers — commercially licensed (purchased by NVIDIA); GarmentMeasurement — Generated using the source code; Bones RigPlay - commercially licensed (purchased by NVIDIA)
 
-### Testing Dataset:
+## Testing Dataset:
 Not applicable 
 
-### Evaluation Dataset:
+## Evaluation Dataset:
 Not applicable
 
 Data Collection Method: Synthetic <br>

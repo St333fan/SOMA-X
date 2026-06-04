@@ -1,5 +1,6 @@
+import logging
 import os
-from typing import Any, Dict, Optional, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -7,13 +8,80 @@ import torch.nn as nn
 
 from .units import Unit
 
-ArrayLike = Union[np.ndarray, torch.Tensor]
+logger = logging.getLogger(__name__)
+
+ArrayLike = np.ndarray | torch.Tensor
 
 
 def _as_float_tensor(x: ArrayLike) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
         return x.float()
     return torch.tensor(x, dtype=torch.float32)
+
+
+def _as_index_tensor(indices: ArrayLike, name: str, size: int) -> torch.Tensor:
+    idx = torch.as_tensor(indices)
+    if idx.dtype == torch.bool:
+        if idx.ndim != 1 or idx.numel() != size:
+            raise ValueError(
+                f"{name} boolean mask must have shape ({size},), got {tuple(idx.shape)}"
+            )
+        idx = torch.nonzero(idx, as_tuple=False).flatten()
+    else:
+        if idx.ndim != 1:
+            raise ValueError(f"{name} must be a 1D index array, got shape {tuple(idx.shape)}")
+        if torch.is_floating_point(idx) or torch.is_complex(idx):
+            raise TypeError(f"{name} must contain integer indices")
+        idx = idx.to(dtype=torch.long)
+
+    if idx.numel() > 0 and ((idx < 0).any() or (idx >= size).any()):
+        raise IndexError(f"{name} contains indices outside [0, {size})")
+
+    return idx.cpu()
+
+
+def _slice_checkpoint_tensors(
+    *,
+    bindpose: torch.Tensor,
+    W1: torch.Tensor,
+    W2: torch.Tensor,
+    M1_mask: torch.Tensor | None,
+    M2_mask: torch.Tensor | None,
+    cors_per_joint: int,
+    v_index_map: ArrayLike | None = None,
+    joint_indices: ArrayLike | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if W2.shape[1] % 3 != 0:
+        raise ValueError(f"W2 width must be divisible by 3, got {W2.shape[1]}")
+
+    num_joints = int(bindpose.shape[0])
+    num_verts = int(W2.shape[1] // 3)
+
+    if v_index_map is not None:
+        v_idx = _as_index_tensor(v_index_map, "v_index_map", num_verts)
+        xyz = torch.arange(3, dtype=torch.long)
+        col_idx = (v_idx[:, None] * 3 + xyz).reshape(-1)
+
+        W2 = W2[:, col_idx.to(W2.device)]
+        M2_mask = M2_mask[:, v_idx.to(M2_mask.device)] if M2_mask is not None else None
+
+    if joint_indices is not None:
+        j_idx = _as_index_tensor(joint_indices, "joint_indices", num_joints)
+        dof_idx = (j_idx[:, None] * 6 + torch.arange(6, dtype=torch.long)).reshape(-1)
+        corrective_idx = (
+            j_idx[:, None] * cors_per_joint
+            + torch.arange(cors_per_joint, dtype=torch.long)
+        ).reshape(-1)
+
+        bindpose = bindpose[j_idx.to(bindpose.device)]
+        W1 = W1[dof_idx.to(W1.device)][:, corrective_idx.to(W1.device)]
+        W2 = W2[corrective_idx.to(W2.device)]
+        if M1_mask is not None:
+            m1_j_idx = j_idx.to(M1_mask.device)
+            M1_mask = M1_mask[m1_j_idx][:, m1_j_idx]
+        M2_mask = M2_mask[j_idx.to(M2_mask.device)] if M2_mask is not None else None
+
+    return bindpose, W1, W2, M1_mask, M2_mask
 
 
 class NonPersistentModuleWrapper(nn.Module):
@@ -53,30 +121,31 @@ class CorrectivesMLP(nn.Module):
     def __init__(
         self,
         *,
-        bindpose: ArrayLike,        # (J, 4, 4) or (J, 3, 3)
-        cors_per_joint: int,        # Num correctives per joint
-        num_verts: int,             # number of vertices in the target mesh
-        M1_mask: Optional[ArrayLike]=None,         # (J,J)
-        M2_mask: Optional[ArrayLike]=None,         # (J,V)
-        W1_init: Optional[torch.Tensor]=None,
-        W2_init: Optional[torch.Tensor]=None,
-        dropout_p: float = 0.0,                   # dropout probability on hidden activations
-        use_tanh: bool = True,                    # apply tanh after relu on hidden activations
+        bindpose: ArrayLike,  # (J, 4, 4) or (J, 3, 3)
+        cors_per_joint: int,  # Num correctives per joint
+        num_verts: int,  # number of vertices in the target mesh
+        M1_mask: ArrayLike | None = None,  # (J,J)
+        M2_mask: ArrayLike | None = None,  # (J,V)
+        W1_init: torch.Tensor | None = None,
+        W2_init: torch.Tensor | None = None,
+        dropout_p: float = 0.0,  # dropout probability on hidden activations
+        use_tanh: bool = True,  # apply tanh after relu on hidden activations
     ):
         super().__init__()
 
         self.use_tanh = use_tanh
-        self.J = bindpose.shape[0]      # num joints
-        self.C = int(cors_per_joint)    # num correctives per joint
-        self.K = self.J * self.C        # total num correctives
-        self.I = 6                      # num input features per joint
-        self.D = self.I * self.J        # total num input features
-        self.V = num_verts              # number of vertices in the target mesh
+        self.J = bindpose.shape[0]  # num joints
+        self.C = int(cors_per_joint)  # num correctives per joint
+        self.K = self.J * self.C  # total num correctives
+        self.I = 6  # num input features per joint
+        self.D = self.I * self.J  # total num input features
+        self.V = num_verts  # number of vertices in the target mesh
 
         # ---- non persistent buffers ----
         if M1_mask is not None:
-            assert (M1_mask.shape[0] == M1_mask.shape[1] and
-                    self.J == M1_mask.shape[0]), 'M1_mask needs to be of shape (J,J)'
+            assert M1_mask.shape[0] == M1_mask.shape[1] and self.J == M1_mask.shape[0], (
+                "M1_mask needs to be of shape (J,J)"
+            )
             M1_prior = _as_float_tensor(M1_mask).repeat_interleave(self.I, dim=0)
             M1_prior = M1_prior.repeat_interleave(self.C, dim=1)
             self.register_buffer("M1_prior", M1_prior, persistent=False)
@@ -86,8 +155,9 @@ class CorrectivesMLP(nn.Module):
             self.M1_mask = None
 
         if M2_mask is not None:
-            assert (M2_mask.shape[0] == self.J and
-                    M2_mask.shape[1] == self.V), 'M2_mask needs to be of shape (J, V)'
+            assert M2_mask.shape[0] == self.J and M2_mask.shape[1] == self.V, (
+                "M2_mask needs to be of shape (J, V)"
+            )
             M2_prior = _as_float_tensor(M2_mask).repeat_interleave(self.C, dim=0)
             M2_prior = M2_prior.repeat_interleave(3, dim=1)
             self.register_buffer("M2_prior", M2_prior, persistent=False)
@@ -112,7 +182,7 @@ class CorrectivesMLP(nn.Module):
         else:
             self.W2 = nn.Parameter(W2_init)
 
-    def forward(self, x: torch.Tensor, V: torch.Tensor= None):
+    def forward(self, x: torch.Tensor, V: torch.Tensor = None):
 
         B = x.shape[0]
 
@@ -135,11 +205,22 @@ class CorrectivesMLP(nn.Module):
         output = {
             "out": y.view(B, -1, 3),
             "z": z,
-            "W2": self.W2,        # raw W2 (used for regularization)
-            "W2_masked": W2,      # W2 * M2_prior (actual geometric contribution)
+            "W2": self.W2,  # raw W2 (used for regularization)
+            "W2_masked": W2,  # W2 * M2_prior (actual geometric contribution)
         }
 
         return output
+
+    def apply_w2_vertex_mask(self, vertex_mask: torch.Tensor) -> None:
+        if not isinstance(vertex_mask, torch.Tensor):
+            raise TypeError("vertex_mask must be a torch.Tensor")
+        if vertex_mask.shape != (self.V,):
+            raise ValueError(f"vertex_mask must have shape ({self.V},), got {vertex_mask.shape}")
+
+        mask = vertex_mask.to(dtype=self.W2.dtype, device=self.W2.device)
+        mask = mask.reshape(1, self.V, 1).expand(1, self.V, 3).reshape(1, 3 * self.V)
+        with torch.no_grad():
+            self.W2.mul_(mask)
 
     # ------------------------------------------------------------------------------
     # Checkpoints
@@ -150,17 +231,31 @@ class CorrectivesMLP(nn.Module):
         path: str,
         *,
         native_unit: Unit = Unit.CENTIMETERS,
-        optimizer: Optional[torch.optim.Optimizer] = None,
-        scheduler: Optional[Any] = None,
-        meta: Optional[Dict[str, Any]] = None,
-        save_masks = True
+        optimizer: torch.optim.Optimizer | None = None,
+        scheduler: Any | None = None,
+        meta: dict[str, Any] | None = None,
+        save_masks=True,
     ) -> None:
         payload = {
             "C_max": self.C,
             "use_tanh": self.use_tanh,
             "bindpose": self.bindpose.cpu(),
-            "W1": ((self.W1 * self.M1_prior) if (self.M1_prior is not None and not save_masks) else self.W1).detach().to_sparse().cpu(),
-            "W2": ((self.W2 * self.M2_prior) if (self.M2_prior is not None and not save_masks) else self.W2).detach().to_sparse().cpu(),
+            "W1": (
+                (self.W1 * self.M1_prior)
+                if (self.M1_prior is not None and not save_masks)
+                else self.W1
+            )
+            .detach()
+            .to_sparse()
+            .cpu(),
+            "W2": (
+                (self.W2 * self.M2_prior)
+                if (self.M2_prior is not None and not save_masks)
+                else self.W2
+            )
+            .detach()
+            .to_sparse()
+            .cpu(),
             "meta": meta or {},
         }
         if save_masks:
@@ -182,7 +277,8 @@ class CorrectivesMLP(nn.Module):
         optimizer: torch.optim.Optimizer | None = None,
         scheduler: Any | None = None,
         map_location: str | torch.device = "cpu",
-        v_index_map: torch.Tensor | None = None,
+        joint_indices: ArrayLike | None = None,
+        v_index_map: ArrayLike | None = None,
         output_unit: Unit = Unit.METERS,
     ):
         if not os.path.exists(path):
@@ -207,7 +303,7 @@ class CorrectivesMLP(nn.Module):
         model_scale = native_unit.meters_per_unit / output_unit.meters_per_unit
 
         cors_per_joint = ckpt["C_max"]
-        use_tanh = ckpt.get("use_tanh")
+        use_tanh = ckpt.get("use_tanh", True)
         bindpose = ckpt["bindpose"]
         W1 = ckpt["W1"].to_dense()
         W2 = ckpt["W2"].to_dense() * model_scale
@@ -215,13 +311,16 @@ class CorrectivesMLP(nn.Module):
         M1_mask = ckpt["M1_mask"].to_dense() if "M1_mask" in ckpt else None
         M2_mask = ckpt["M2_mask"].to_dense() if "M2_mask" in ckpt else None
 
-        if v_index_map is not None:
-            v_index_map = v_index_map.cpu()
-            M2_mask = M2_mask[:, v_index_map] if M2_mask is not None else None
-            col_idx = (v_index_map[:, None] * 3 + torch.arange(3)).reshape(-1)
-            W2 = W2[:, col_idx]
-
-        num_verts = int(W2.shape[1] // 3)
+        bindpose, W1, W2, M1_mask, M2_mask = _slice_checkpoint_tensors(
+            bindpose=bindpose,
+            W1=W1,
+            W2=W2,
+            M1_mask=M1_mask,
+            M2_mask=M2_mask,
+            cors_per_joint=cors_per_joint,
+            v_index_map=v_index_map,
+            joint_indices=joint_indices,
+        )
 
         num_verts = int(W2.shape[1] // 3)
         model = CorrectivesMLP(
@@ -241,12 +340,12 @@ class CorrectivesMLP(nn.Module):
             try:
                 optimizer.load_state_dict(ckpt["optimizer_state"])
             except Exception as e:
-                print(f"[WARN] Optimizer state not loaded: {e}")
+                logger.warning("Optimizer state not loaded: %s", e)
 
         if scheduler is not None and "scheduler_state" in ckpt:
             try:
                 scheduler.load_state_dict(ckpt["scheduler_state"])
             except Exception as e:
-                print(f"[WARN] Scheduler state not loaded: {e}")
+                logger.warning("Scheduler state not loaded: %s", e)
 
         return model

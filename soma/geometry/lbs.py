@@ -1,10 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""PyTorch linear blend skinning and Rodrigues conversion helpers."""
+
 import torch
 
 
-def batch_rodrigues(rot_vecs, epsilon=1e-8, dtype=torch.float32):
+def batch_rodrigues(
+    rot_vecs: torch.Tensor,
+    epsilon: float = 1e-8,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     """Calculates the rotation matrices for a batch of rotation vectors
     Parameters
     ----------
@@ -42,7 +48,11 @@ def batch_rodrigues(rot_vecs, epsilon=1e-8, dtype=torch.float32):
     return rot_mat
 
 
-def lbs(bind_shape, skinning_weights, target_pose_world):
+def lbs(
+    bind_shape: torch.Tensor,
+    skinning_weights: torch.Tensor,
+    target_pose_world: torch.Tensor,
+) -> torch.Tensor:
     """
     Linear Blend Skinning (PyTorch).
 

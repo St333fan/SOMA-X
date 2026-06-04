@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import os
 import sys
 import types
-from typing import Optional, Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def default_pyopengl_platform() -> str:
@@ -23,7 +25,7 @@ def _ensure_headless_pyrender() -> None:
     sys.modules["pyrender.viewer"] = viewer_mod
 
 
-def set_pyopengl_platform(platform: Optional[str]) -> None:
+def set_pyopengl_platform(platform: str | None) -> None:
     if platform:
         os.environ.setdefault("PYOPENGL_PLATFORM", platform)
 
@@ -93,7 +95,7 @@ class MeshRenderer:
     def __init__(
         self,
         image_size: int = 512,
-        bg_color: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
+        bg_color: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
         focal_length: float = 4000.0,
         light_intensity: float = 3.0,
     ):
@@ -123,12 +125,12 @@ class MeshRenderer:
     def setup_mesh(
         self,
         faces: np.ndarray,
-        mesh_color: Tuple[float, float, float, float] = (0.69, 0.39, 0.96, 1.0),
-        cam_pose: Optional[np.ndarray] = None,
-        light_dir: Optional[np.ndarray] = None,
+        mesh_color: tuple[float, float, float, float] = (0.69, 0.39, 0.96, 1.0),
+        cam_pose: np.ndarray | None = None,
+        light_dir: np.ndarray | None = None,
         metallic: float = 0.0,
         roughness: float = 0.5,
-        base_color_factor: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
+        base_color_factor: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
     ):
         """Pre-compute scene state that stays constant across a frame sequence.
 
@@ -191,12 +193,12 @@ class MeshRenderer:
         self,
         vertices: np.ndarray,
         faces: np.ndarray,
-        mesh_color: Tuple[float, float, float, float] = (0.69, 0.39, 0.96, 1.0),
-        cam_pose: Optional[np.ndarray] = None,
-        light_dir: Optional[np.ndarray] = None,
+        mesh_color: tuple[float, float, float, float] = (0.69, 0.39, 0.96, 1.0),
+        cam_pose: np.ndarray | None = None,
+        light_dir: np.ndarray | None = None,
         metallic: float = 0.0,
         roughness: float = 0.5,
-        base_color_factor: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
+        base_color_factor: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
     ) -> np.ndarray:
         import trimesh
 
@@ -254,12 +256,12 @@ def render_mesh(
     vertices: np.ndarray,
     faces: np.ndarray,
     image_size: int = 512,
-    bg_color: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
-    mesh_color: Tuple[float, float, float, float] = (0.69, 0.39, 0.96, 1.0),
+    bg_color: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
+    mesh_color: tuple[float, float, float, float] = (0.69, 0.39, 0.96, 1.0),
     focal_length: float = 4000.0,
     light_intensity: float = 3.0,
     cam_pose=None,
-    light_dir: Optional[np.ndarray] = None,
+    light_dir: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Legacy function for backward compatibility.
@@ -279,6 +281,122 @@ def render_mesh(
     return color
 
 
+def build_skeleton_mesh(
+    joint_positions: np.ndarray,
+    parent_ids: np.ndarray,
+    *,
+    joint_radius: float,
+    bone_radius: float,
+):
+    """Build a trimesh skeleton from joint spheres and bone cylinders."""
+    import trimesh
+
+    joints = np.asarray(joint_positions, dtype=np.float32)
+    parents = np.asarray(parent_ids, dtype=np.int32)
+    parts = []
+    for pos in joints:
+        sphere = trimesh.creation.uv_sphere(radius=joint_radius, count=[8, 8])
+        sphere.apply_translation(pos)
+        parts.append(sphere)
+
+    z_axis = np.array([0.0, 0.0, 1.0])
+    for joint_idx, parent_idx in enumerate(parents):
+        parent_idx = int(parent_idx)
+        if parent_idx < 0 or parent_idx == joint_idx or parent_idx >= len(joints):
+            continue
+        p0 = joints[parent_idx].astype(np.float64)
+        p1 = joints[joint_idx].astype(np.float64)
+        segment = p1 - p0
+        length = np.linalg.norm(segment)
+        if length < 1e-6:
+            continue
+        cylinder = trimesh.creation.cylinder(radius=bone_radius, height=length, sections=8)
+        direction = segment / length
+        v = np.cross(z_axis, direction)
+        s = np.linalg.norm(v)
+        c = np.dot(z_axis, direction)
+        if s > 1e-6:
+            vx = np.array(
+                [
+                    [0.0, -v[2], v[1]],
+                    [v[2], 0.0, -v[0]],
+                    [-v[1], v[0], 0.0],
+                ]
+            )
+            rot = np.eye(3) + vx + vx @ vx * (1.0 - c) / (s * s)
+        else:
+            rot = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+        transform = np.eye(4)
+        transform[:3, :3] = rot
+        transform[:3, 3] = (p0 + p1) * 0.5
+        cylinder.apply_transform(transform)
+        parts.append(cylinder)
+
+    return trimesh.util.concatenate(parts) if parts else trimesh.Trimesh()
+
+
+def render_mesh_panel(
+    renderer: MeshRenderer,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    mesh_color: tuple[float, float, float, float],
+    cam_pose: np.ndarray,
+    light_dir: np.ndarray,
+    metallic: float = 0.0,
+    roughness: float = 0.5,
+    base_color_factor: tuple[float, float, float, float] = (0.9, 0.9, 0.9, 1.0),
+) -> np.ndarray:
+    renderer.setup_mesh(
+        faces=faces,
+        mesh_color=mesh_color,
+        metallic=metallic,
+        roughness=roughness,
+        cam_pose=cam_pose,
+        light_dir=light_dir,
+        base_color_factor=base_color_factor,
+    )
+    return renderer.render_frame(vertices)
+
+
+def overlay_skeleton(
+    renderer: MeshRenderer,
+    image: np.ndarray,
+    joints: np.ndarray,
+    parent_ids: np.ndarray,
+    *,
+    color: tuple[float, float, float, float],
+    cam_pose: np.ndarray,
+    light_dir: np.ndarray,
+    joint_radius: float,
+    bone_radius: float,
+    metallic: float = 0.0,
+    roughness: float = 0.5,
+) -> np.ndarray:
+    skeleton = build_skeleton_mesh(
+        joints,
+        parent_ids,
+        joint_radius=joint_radius,
+        bone_radius=bone_radius,
+    )
+    if skeleton.vertices.shape[0] == 0 or skeleton.faces.shape[0] == 0:
+        return image
+    skel_image = render_mesh_panel(
+        renderer,
+        np.asarray(skeleton.vertices, dtype=np.float32),
+        np.asarray(skeleton.faces, dtype=np.int32),
+        mesh_color=color,
+        cam_pose=cam_pose,
+        light_dir=light_dir,
+        metallic=metallic,
+        roughness=roughness,
+    )
+    out = image.copy()
+    mask = skel_image.mean(axis=-1) < 245
+    out[mask] = skel_image[mask]
+    return out
+
+
 def render_comparison_video(
     out_path: str,
     verts_source: np.ndarray,
@@ -286,10 +404,10 @@ def render_comparison_video(
     verts_soma: np.ndarray,
     faces_soma: np.ndarray,
     *,
-    color_source: Tuple[float, float, float, float] = (0.98, 0.65, 0.15, 1.0),
-    color_soma: Tuple[float, float, float, float] = (0.55, 0.15, 0.85, 1.0),
-    cam_pose: Optional[np.ndarray] = None,
-    light_dir: Optional[np.ndarray] = None,
+    color_source: tuple[float, float, float, float] = (0.98, 0.65, 0.15, 1.0),
+    color_soma: tuple[float, float, float, float] = (0.55, 0.15, 0.85, 1.0),
+    cam_pose: np.ndarray | None = None,
+    light_dir: np.ndarray | None = None,
     image_size: int = 1024,
     fps: int = 30,
     center: bool = False,
@@ -362,7 +480,7 @@ def render_comparison_video(
 
     writer.close()
     renderer.delete()
-    print(f"\nSaved: {out_path}  ({label_source}=orange, {label_soma}=purple)")
+    logger.info(f"\nSaved: {out_path}  ({label_source}=orange, {label_soma}=purple)")
 
 
 def save_image(path: str, image: np.ndarray) -> None:

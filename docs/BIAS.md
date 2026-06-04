@@ -1,3 +1,5 @@
+# Bias
+
 Field | Response
 :-----|:--------
 Participation considerations from adversely impacted groups ([protected classes](https://www.senate.ca.gov/content/protected-classes)) in model design and testing: | The SOMA native shape PCA was fitted on a combination of SizeUSA (large-scale U.S. anthropometric survey) and TripleGangers (303 individuals, commercially purchased). While SizeUSA covers a broad range of age, sex, and BMI groups, both datasets reflect body shapes predominantly from North American/Western populations and may under-represent shapes common in other geographic regions (e.g., South/Southeast Asia, Sub-Saharan Africa). SOMA mitigates this by adding additional data from GarmentMeasurements which contains some european population and by supporting the ANNY backend, which derives body shapes from anthropometric measurements rather than 3D scan data, enabling representation of human body shapes from infants to elders without inheriting scan-collection demographic biases.

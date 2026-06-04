@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Rotation and rigid-transform helpers used across SOMA geometry modules."""
+
+from typing import Literal
+
 import torch
 import torch.nn.functional as F
 
@@ -8,8 +12,19 @@ import torch.nn.functional as F
 # Modular Rotation Estimation Functions
 # ============================================================================
 
+AlignmentMethod = Literal["kabsch", "newton-schulz", "auto"]
+NEWTON_SCHULZ_ITERS = 30
+AUTO_ROTATION_PRIOR_STRENGTH = 0.05
+AUTO_ROTATION_RANK_THRESHOLD = 2e-2
+AUTO_ROTATION_DEGENERATE_THRESHOLD = 1e-6
 
-def compute_covariance(A, B, virtual_normal=True, eps=1e-8):
+
+def compute_covariance(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    virtual_normal: bool = True,
+    eps: float = 1e-8,
+) -> torch.Tensor:
     """Compute covariance matrix H = A^T @ B for rotation estimation.
 
     Args:
@@ -56,7 +71,7 @@ def compute_covariance(A, B, virtual_normal=True, eps=1e-8):
     return H
 
 
-def kabsch(H):
+def kabsch(H: torch.Tensor) -> torch.Tensor:
     """Compute rotation matrix from covariance using Kabsch algorithm (SVD).
 
     Args:
@@ -80,16 +95,17 @@ def kabsch(H):
     return R
 
 
-def newton_schulz(H, num_iters=20, eps=1e-8):
+def newton_schulz(H: torch.Tensor, num_iters: int = 30, eps: float = 1e-8) -> torch.Tensor:
     """Compute rotation matrix from covariance using Newton-Schulz iteration.
 
     This is primarily a reference implementation for testing and comparing against
-    the Warp-accelerated Newton-Schulz kernel. For production use, prefer `kabsch()`
-    which is more stable and has better-defined gradients through SVD.
+    the Warp-accelerated Newton-Schulz kernel. Production callers should pair
+    Newton-Schulz with validity checks or a reference-gauge policy when the
+    covariance is rank deficient.
 
     Args:
         H: Covariance matrix (..., 3, 3)
-        num_iters: Number of iterations (default 20)
+        num_iters: Number of iterations (default 30)
         eps: Small constant for numerical stability
 
     Returns:
@@ -124,7 +140,39 @@ def newton_schulz(H, num_iters=20, eps=1e-8):
     return R_corrected
 
 
-def rodrigues_rotation(a, b, eps=1e-8):
+def regularize_covariance_with_reference(
+    H: torch.Tensor,
+    reference_rotation: torch.Tensor | None = None,
+    prior_strength: float = AUTO_ROTATION_PRIOR_STRENGTH,
+    rank_threshold: float = AUTO_ROTATION_RANK_THRESHOLD,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Add a weak reference-gauge prior to a Procrustes covariance matrix."""
+    prior_scale = torch.abs(H).sum(dim=-1).amax(dim=-1).clamp_min(eps)
+    volume_score = torch.linalg.det(H).abs() / prior_scale.pow(3)
+    rank_weight = ((rank_threshold - volume_score) / rank_threshold).clamp(0.0, 1.0)
+    if reference_rotation is None:
+        reference_rotation = torch.eye(3, dtype=H.dtype, device=H.device).expand(H.shape)
+    return H + (prior_strength * rank_weight * prior_scale)[..., None, None] * reference_rotation
+
+
+def rotation_matrices_are_valid(
+    R: torch.Tensor,
+    det_tol: float = 1e-2,
+    orthogonality_tol: float = 1e-2,
+) -> torch.Tensor:
+    """Return a boolean mask for finite right-handed orthonormal rotations."""
+    finite = torch.isfinite(R).all(dim=(-2, -1))
+    det_R = torch.linalg.det(R)
+    det_valid = torch.isfinite(det_R) & (det_R > 0.0) & ((det_R - 1.0).abs() <= det_tol)
+
+    eye = torch.eye(3, dtype=R.dtype, device=R.device)
+    ortho_err = (R.swapaxes(-2, -1) @ R - eye).abs().amax(dim=(-2, -1))
+    ortho_valid = torch.isfinite(ortho_err) & (ortho_err <= orthogonality_tol)
+    return finite & det_valid & ortho_valid
+
+
+def rodrigues_rotation(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Compute rotation matrix that aligns vector b to vector a.
 
     Uses the shortest arc rotation approach similar to SciPy's align_vectors.
@@ -198,7 +246,12 @@ def rodrigues_rotation(a, b, eps=1e-8):
 # ============================================================================
 
 
-def align_vectors(A, B, eps=1e-8, method="kabsch"):
+def align_vectors(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    eps: float = 1e-8,
+    method: AlignmentMethod = "auto",
+) -> torch.Tensor:
     """
     SciPy-compatible: return rotation C such that C @ b ≈ a.
     Supports broadcasting across leading batch dims. Inputs: (..., N, 3).
@@ -207,7 +260,7 @@ def align_vectors(A, B, eps=1e-8, method="kabsch"):
         A: Target vectors (..., N, 3)
         B: Source vectors (..., N, 3)
         eps: Small constant for numerical stability
-        method: 'kabsch' (SVD-based) or 'newton-schulz' (iterative)
+        method: 'auto', 'kabsch' (SVD-based), or 'newton-schulz' (iterative)
     """
     if A.shape[-1] != 3 or B.shape[-1] != 3:
         raise NotImplementedError("Only 3D vectors are supported (last dim must be 3).")
@@ -222,14 +275,29 @@ def align_vectors(A, B, eps=1e-8, method="kabsch"):
     H = compute_covariance(A, B, virtual_normal=True, eps=eps)
 
     if method == "newton-schulz":
-        return newton_schulz(H, num_iters=20, eps=eps)
+        R = newton_schulz(H, num_iters=NEWTON_SCHULZ_ITERS, eps=eps)
+        valid = rotation_matrices_are_valid(R)
+        if torch.all(valid):
+            return R
+        return torch.where(valid[..., None, None], R, kabsch(H))
+    elif method == "auto":
+        H_auto = regularize_covariance_with_reference(
+            H,
+            rank_threshold=AUTO_ROTATION_DEGENERATE_THRESHOLD,
+            eps=eps,
+        )
+        R = newton_schulz(H_auto, num_iters=NEWTON_SCHULZ_ITERS, eps=eps)
+        valid = rotation_matrices_are_valid(R)
+        if torch.all(valid):
+            return R
+        return torch.where(valid[..., None, None], R, kabsch(H_auto))
     elif method == "kabsch":
         return kabsch(H)
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'kabsch' or 'newton-schulz'.")
+        raise ValueError(f"Unknown method: {method}. Use 'auto', 'kabsch', or 'newton-schulz'.")
 
 
-def SE3_from_Rt(R, t):
+def SE3_from_Rt(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     """
     autograd-safe SE(3) transform construction from rotation R and translation t.
     R: (..., 3, 3)
@@ -248,7 +316,7 @@ def SE3_from_Rt(R, t):
     return torch.cat([upper, last_row], dim=-2)  # (..., 4, 4)
 
 
-def SE3_inverse(T):
+def SE3_inverse(T: torch.Tensor) -> torch.Tensor:
     """
     Invert SE(3) transform(s) in homogeneous coordinates.
 
@@ -269,7 +337,292 @@ def SE3_inverse(T):
 # --- SO(3) conversions --------------------------------------------------------
 
 
-def matrix_to_rotvec(R, eps=1e-6):
+def euler_xyz_to_matrix(euler_xyz: torch.Tensor) -> torch.Tensor:
+    """Convert XYZ Euler angles to rotation matrices.
+
+    Args:
+        euler_xyz: (..., 3) angles in radians, ordered as X, Y, Z.
+
+    Returns:
+        (..., 3, 3) rotation matrices.
+    """
+    if euler_xyz.shape[-1] != 3:
+        raise ValueError(f"Expected (...,3), got {euler_xyz.shape}")
+
+    cos_angles = torch.cos(euler_xyz)
+    sin_angles = torch.sin(euler_xyz)
+    cx, cy, cz = cos_angles[..., 0], cos_angles[..., 1], cos_angles[..., 2]
+    sx, sy, sz = sin_angles[..., 0], sin_angles[..., 1], sin_angles[..., 2]
+    return torch.stack(
+        [
+            cy * cz,
+            -cx * sz + sx * sy * cz,
+            sx * sz + cx * sy * cz,
+            cy * sz,
+            cx * cz + sx * sy * sz,
+            -sx * cz + cx * sy * sz,
+            -sy,
+            sx * cy,
+            cx * cy,
+        ],
+        dim=-1,
+    ).reshape(euler_xyz.shape[:-1] + (3, 3))
+
+
+def matrix_to_euler_xyz(R: torch.Tensor) -> torch.Tensor:
+    """Convert rotation matrices to XYZ Euler angles.
+
+    Args:
+        R: (..., 3, 3) rotation matrices.
+
+    Returns:
+        (..., 3) angles in radians, ordered as X, Y, Z.
+    """
+    if R.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected (...,3,3), got {R.shape}")
+
+    sy = -R[..., 2, 0].clamp(-1.0, 1.0)
+    y = torch.asin(sy)
+    x = torch.atan2(R[..., 2, 1], R[..., 2, 2])
+    z = torch.atan2(R[..., 1, 0], R[..., 0, 0])
+    return torch.stack([x, y, z], dim=-1)
+
+
+def quaternion_normalize_xyzw(quaternion: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Normalize XYZW quaternions.
+
+    Args:
+        quaternion: (..., 4) quaternions ordered as x, y, z, w.
+        eps: Small constant used when normalizing quaternions.
+
+    Returns:
+        (..., 4) unit quaternions ordered as x, y, z, w.
+    """
+    if quaternion.shape[-1] != 4:
+        raise ValueError(f"Expected (...,4), got {quaternion.shape}")
+    return quaternion / quaternion.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+
+def quaternion_conjugate_xyzw(quaternion: torch.Tensor) -> torch.Tensor:
+    """Return the conjugate of XYZW quaternions."""
+    if quaternion.shape[-1] != 4:
+        raise ValueError(f"Expected (...,4), got {quaternion.shape}")
+    out = quaternion.clone()
+    out[..., :3] = -out[..., :3]
+    return out
+
+
+def quaternion_multiply_xyzw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of XYZW quaternions.
+
+    Args:
+        a: (..., 4) left quaternions ordered as x, y, z, w.
+        b: (..., 4) right quaternions ordered as x, y, z, w.
+
+    Returns:
+        (..., 4) product quaternions ordered as x, y, z, w.
+    """
+    if a.shape[-1] != 4 or b.shape[-1] != 4:
+        raise ValueError(f"Expected (...,4) operands, got {a.shape} and {b.shape}")
+    ax, ay, az, aw = a.unbind(dim=-1)
+    bx, by, bz, bw = b.unbind(dim=-1)
+    return torch.stack(
+        (
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ),
+        dim=-1,
+    )
+
+
+def quaternion_xyzw_to_matrix(quaternion: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Convert XYZW quaternions to rotation matrices.
+
+    Args:
+        quaternion: (..., 4) quaternions ordered as x, y, z, w.
+        eps: Small constant used when normalizing quaternions.
+
+    Returns:
+        (..., 3, 3) rotation matrices.
+    """
+    q = quaternion_normalize_xyzw(quaternion, eps=eps)
+    x, y, z, w = q.unbind(dim=-1)
+    return torch.stack(
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+            2.0 * (x * y + w * z),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - w * x),
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+        dim=-1,
+    ).reshape(quaternion.shape[:-1] + (3, 3))
+
+
+def matrix_to_quaternion_xyzw(R: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Convert rotation matrices to XYZW unit quaternions.
+
+    Args:
+        R: (..., 3, 3) rotation matrices.
+        eps: Small constant used when normalizing quaternions.
+
+    Returns:
+        (..., 4) quaternions ordered as x, y, z, w with non-negative w.
+    """
+    if R.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected (...,3,3), got {R.shape}")
+
+    m00 = R[..., 0, 0]
+    m01 = R[..., 0, 1]
+    m02 = R[..., 0, 2]
+    m10 = R[..., 1, 0]
+    m11 = R[..., 1, 1]
+    m12 = R[..., 1, 2]
+    m20 = R[..., 2, 0]
+    m21 = R[..., 2, 1]
+    m22 = R[..., 2, 2]
+
+    qw = 0.5 * torch.sqrt((1.0 + m00 + m11 + m22).clamp_min(0.0))
+    qx = 0.5 * torch.copysign(
+        torch.sqrt((1.0 + m00 - m11 - m22).clamp_min(0.0)),
+        m21 - m12,
+    )
+    qy = 0.5 * torch.copysign(
+        torch.sqrt((1.0 - m00 + m11 - m22).clamp_min(0.0)),
+        m02 - m20,
+    )
+    qz = 0.5 * torch.copysign(
+        torch.sqrt((1.0 - m00 - m11 + m22).clamp_min(0.0)),
+        m10 - m01,
+    )
+    return quaternion_normalize_xyzw(torch.stack((qx, qy, qz, qw), dim=-1), eps=eps)
+
+
+def matrix_to_quaternion_xyzw_stable(
+    R: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Convert rotation matrices to XYZW quaternions with finite sqrt gradients.
+
+    This follows the same signed-branch convention as ``matrix_to_quaternion_xyzw``
+    but adds a tiny value inside each square root.  It is intended for code paths
+    that need gradients through matrix-to-quaternion conversion near zero-valued
+    branches.
+    """
+    if R.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected (...,3,3), got {R.shape}")
+
+    m00 = R[..., 0, 0]
+    m01 = R[..., 0, 1]
+    m02 = R[..., 0, 2]
+    m10 = R[..., 1, 0]
+    m11 = R[..., 1, 1]
+    m12 = R[..., 1, 2]
+    m20 = R[..., 2, 0]
+    m21 = R[..., 2, 1]
+    m22 = R[..., 2, 2]
+
+    qw = 0.5 * torch.sqrt((1.0 + m00 + m11 + m22).clamp_min(0.0) + eps)
+    qx = 0.5 * torch.copysign(
+        torch.sqrt((1.0 + m00 - m11 - m22).clamp_min(0.0) + eps),
+        m21 - m12,
+    )
+    qy = 0.5 * torch.copysign(
+        torch.sqrt((1.0 - m00 + m11 - m22).clamp_min(0.0) + eps),
+        m02 - m20,
+    )
+    qz = 0.5 * torch.copysign(
+        torch.sqrt((1.0 - m00 - m11 + m22).clamp_min(0.0) + eps),
+        m10 - m01,
+    )
+    return quaternion_normalize_xyzw(torch.stack((qx, qy, qz, qw), dim=-1), eps=eps)
+
+
+def single_axis_rotation_matrices(
+    angles: torch.Tensor,
+    axis: int,
+    axis_signs: torch.Tensor,
+) -> torch.Tensor:
+    """Create rotation matrices for angles around one shared local axis."""
+    signed_angles = angles * axis_signs.to(dtype=angles.dtype, device=angles.device)[None]
+    c = torch.cos(signed_angles)
+    s = torch.sin(signed_angles)
+    z = torch.zeros_like(signed_angles)
+    o = torch.ones_like(signed_angles)
+    if axis == 0:
+        values = (o, z, z, z, c, -s, z, s, c)
+    elif axis == 1:
+        values = (c, z, s, z, o, z, -s, z, c)
+    elif axis == 2:
+        values = (c, -s, z, s, c, z, z, z, o)
+    else:
+        raise ValueError(f"axis must be 0, 1, or 2, got {axis}")
+    return torch.stack(values, dim=-1).reshape(*angles.shape, 3, 3)
+
+
+def quaternion_half_angle_xyzw(quaternion: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Return the principal half-angle quaternion for XYZW rotations.
+
+    ``q`` and ``-q`` represent the same rotation. This helper first chooses the
+    representation with non-negative ``w`` and then computes the normalized
+    square-root quaternion ``sqrt(q)`` using ``[v, w + 1]``. This is useful when
+    extracting twist angles near 180 degrees without an unstable full-angle
+    projection.
+    """
+    q = quaternion_normalize_xyzw(quaternion, eps=eps)
+    q = torch.where(q[..., 3:] < 0.0, -q, q)
+    return quaternion_normalize_xyzw(
+        torch.cat((q[..., :3], q[..., 3:] + 1.0), dim=-1),
+        eps=eps,
+    )
+
+
+def quaternion_twist_angle_xyzw(
+    quaternion: torch.Tensor,
+    axis_ids: int | torch.Tensor = 0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Extract signed twist angles around local axes from XYZW quaternions.
+
+    Args:
+        quaternion: (..., 4) quaternions ordered as x, y, z, w.
+        axis_ids: scalar axis id or tensor broadcastable to ``quaternion.shape[:-1]``.
+            Axis ids use ``0=x``, ``1=y``, ``2=z``.
+        eps: Small constant used when normalizing quaternions.
+
+    Returns:
+        ``quaternion.shape[:-1]`` twist angles in radians.
+    """
+    q_half = quaternion_half_angle_xyzw(quaternion, eps=eps)
+    if isinstance(axis_ids, torch.Tensor):
+        axis_ids_t = axis_ids.to(device=quaternion.device, dtype=torch.long)
+    else:
+        axis_ids_t = torch.tensor(axis_ids, dtype=torch.long, device=quaternion.device)
+    if torch.any((axis_ids_t < 0) | (axis_ids_t > 2)):
+        raise ValueError("axis_ids must contain only 0, 1, or 2")
+    if axis_ids_t.ndim == 0:
+        twist_imag = q_half[..., int(axis_ids_t.item())]
+    else:
+        while axis_ids_t.ndim < q_half.ndim - 1:
+            axis_ids_t = axis_ids_t.unsqueeze(0)
+        try:
+            gather_ids = axis_ids_t.expand(q_half.shape[:-1]).unsqueeze(-1)
+        except RuntimeError as e:
+            raise ValueError(
+                "axis_ids must be broadcastable to quaternion.shape[:-1], "
+                f"got {tuple(axis_ids_t.shape)} for {tuple(q_half.shape[:-1])}"
+            ) from e
+        twist_imag = q_half[..., :3].gather(-1, gather_ids).squeeze(-1)
+    return 4.0 * torch.atan2(twist_imag, q_half[..., 3])
+
+
+def matrix_to_rotvec(R: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
     (...,3,3) rotation matrices -> (...,3) rotation vectors (axis * angle).
     Robust for small angles and near-pi.
@@ -327,7 +680,7 @@ def matrix_to_rotvec(R, eps=1e-6):
     return torch.where(near_pi[..., None], w_pi, torch.where(small[..., None], w_small, w_gen))
 
 
-def rotvec_to_matrix(rotvec, eps=1e-8):
+def rotvec_to_matrix(rotvec: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
     (...,3) rotation vectors -> (...,3,3) rotation matrices.
     Robust near zero.
@@ -361,14 +714,15 @@ def rotvec_to_matrix(rotvec, eps=1e-8):
 
 
 def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
-    """
-    Converts 6D rotation representation by Zhou et al. [1] to rotation matrix
-    using Gram--Schmidt orthogonalization per Section B of [1].
+    """Convert 6D rotation representation by Zhou et al. [1] to rotation matrix.
+
+    Uses Gram-Schmidt orthogonalization per Section B of [1].
+
     Args:
-        d6: 6D rotation representation, of size (*, 6)
+        d6: 6D rotation representation, of size ``(*, 6)``.
 
     Returns:
-        batch of rotation matrices of size (*, 3, 3)
+        Batch of rotation matrices of size ``(*, 3, 3)``.
 
     [1] Zhou, Y., Barnes, C., Lu, J., Yang, J., & Li, H.
     On the Continuity of Rotation Representations in Neural Networks.

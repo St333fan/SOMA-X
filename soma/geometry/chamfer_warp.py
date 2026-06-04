@@ -54,11 +54,16 @@ class ChamferLoss(torch.nn.Module):
         self._cached_mesh_ids = None
 
     def forward(self, src_points, target_verts, target_faces=None, refit=False):
-        """
-        src_points: (B, N, 3) or (N, 3) - Source query points
-        target_verts: (B, M, 3) or (M, 3) - Target vertices (supports batching!)
-        target_faces: (F, 3) - Static topology (optional). If None, treats target as point cloud
-                        by creating degenerate triangles (one per vertex)
+        """Compute Chamfer loss from source points to target mesh.
+
+        Args:
+            src_points: ``(B, N, 3)`` or ``(N, 3)`` source query points.
+            target_verts: ``(B, M, 3)`` or ``(M, 3)`` target vertices
+                (supports batching).
+            target_faces: ``(F, 3)`` static topology (optional). If
+                ``None``, treats target as a point cloud by creating
+                degenerate triangles (one per vertex).
+            refit: if True, rebuild the cached target meshes.
         """
         # Ensure batched format
         src_is_batched = src_points.dim() == 3

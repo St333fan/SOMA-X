@@ -5,10 +5,14 @@
 Warp-based implementations of geometric transformations for improved GPU performance.
 """
 
+from typing import Literal
+
 import torch
 import warp as wp
 
-from soma.geometry._warp_init import ensure_warp_initialized
+from soma._warp_utils import cache_warp_kernel, ensure_warp_initialized
+
+AlignmentMethod = Literal["auto", "kabsch", "newton-schulz"]
 
 
 def _get_warp_types(torch_dtype):
@@ -21,6 +25,7 @@ def _get_warp_types(torch_dtype):
         return wp.float32, wp.vec3, wp.mat33
 
 
+@cache_warp_kernel
 def _create_covariance_kernel(dtype_scalar, dtype_vec, dtype_mat):
     """Factory to create covariance kernel for specific dtypes."""
 
@@ -82,6 +87,33 @@ def _create_covariance_kernel(dtype_scalar, dtype_vec, dtype_mat):
             c21 += vec_a[2] * vec_b[1]
             c22 += vec_a[2] * vec_b[2]
 
+        if count >= 2:
+            a0 = flat_a[start_idx]
+            a1 = flat_a[start_idx + 1]
+            b0 = flat_b[start_idx]
+            b1 = flat_b[start_idx + 1]
+
+            n_a = wp.cross(a0, a1)
+            n_b = wp.cross(b0, b1)
+            len_n_a = wp.length(n_a)
+            len_n_b = wp.length(n_b)
+
+            if len_n_a > dtype_scalar(1.0e-9) and len_n_b > dtype_scalar(1.0e-9):
+                v_a = n_a * (wp.length(a0) / (len_n_a + dtype_scalar(1.0e-8)))
+                v_b = n_b * (wp.length(b0) / (len_n_b + dtype_scalar(1.0e-8)))
+
+                c00 += v_a[0] * v_b[0]
+                c01 += v_a[0] * v_b[1]
+                c02 += v_a[0] * v_b[2]
+
+                c10 += v_a[1] * v_b[0]
+                c11 += v_a[1] * v_b[1]
+                c12 += v_a[1] * v_b[2]
+
+                c20 += v_a[2] * v_b[0]
+                c21 += v_a[2] * v_b[1]
+                c22 += v_a[2] * v_b[2]
+
         # Build matrix from accumulated scalars
         # fmt: off
         cov_matrices[tid] = dtype_mat(
@@ -100,6 +132,7 @@ _compute_covariance_fp32 = _create_covariance_kernel(wp.float32, wp.vec3, wp.mat
 _compute_covariance_fp64 = _create_covariance_kernel(wp.float64, wp.vec3d, wp.mat33d)
 
 
+@cache_warp_kernel
 def _create_rodrigues_kernel(dtype_scalar, dtype_vec, dtype_mat):
     """Factory to create Rodrigues rotation kernel for specific dtypes."""
 
@@ -230,6 +263,7 @@ _compute_rodrigues_fp32 = _create_rodrigues_kernel(wp.float32, wp.vec3, wp.mat33
 _compute_rodrigues_fp64 = _create_rodrigues_kernel(wp.float64, wp.vec3d, wp.mat33d)
 
 
+@cache_warp_kernel
 def _create_svd_kernel(dtype_scalar, dtype_vec, dtype_mat):
     """Factory to create SVD/Kabsch kernel for specific dtypes."""
 
@@ -332,6 +366,7 @@ _compute_svd_fp32 = _create_svd_kernel(wp.float32, wp.vec3, wp.mat33)
 _compute_svd_fp64 = _create_svd_kernel(wp.float64, wp.vec3d, wp.mat33d)
 
 
+@cache_warp_kernel
 def _create_newton_schulz_kernel(dtype_scalar, dtype_vec, dtype_mat):
     """Factory to create Newton-Schulz kernel for specific dtypes."""
 
@@ -362,9 +397,9 @@ def _create_newton_schulz_kernel(dtype_scalar, dtype_vec, dtype_mat):
 
         # Order-2 Newton-Schulz iteration
         # R_{k+1} = R_k * (3*I - R_k^T * R_k) / 2
-        # This is more stable than the simple R_{k+1} = 0.5 * (R_k + R_k^{-T})
-        # and doesn't require matrix inverse
-        for _ in range(20):
+        # 30 iterations handles condition ratios up to ~200K, preventing cascade
+        # degradation through deep kinematic chains (fingers).
+        for _ in range(30):
             RT_R = wp.transpose(R) * R
 
             # Compute 3*I - R^T*R
@@ -412,6 +447,101 @@ def _create_newton_schulz_kernel(dtype_scalar, dtype_vec, dtype_mat):
 _compute_newton_schulz_fp16 = _create_newton_schulz_kernel(wp.float16, wp.vec3h, wp.mat33h)
 _compute_newton_schulz_fp32 = _create_newton_schulz_kernel(wp.float32, wp.vec3, wp.mat33)
 _compute_newton_schulz_fp64 = _create_newton_schulz_kernel(wp.float64, wp.vec3d, wp.mat33d)
+
+
+@cache_warp_kernel
+def _create_newton_schulz_auto_kernel(dtype_scalar, dtype_vec, dtype_mat):
+    """Factory to create degenerate-safe Newton-Schulz auto kernels."""
+
+    @wp.kernel
+    def compute_rotations_auto(
+        cov_matrices: wp.array(dtype=dtype_mat),
+        out_rotations: wp.array(dtype=dtype_mat),
+    ):
+        tid = wp.tid()
+        H = cov_matrices[tid]
+
+        row0_sum = wp.abs(H[0, 0]) + wp.abs(H[0, 1]) + wp.abs(H[0, 2])
+        row1_sum = wp.abs(H[1, 0]) + wp.abs(H[1, 1]) + wp.abs(H[1, 2])
+        row2_sum = wp.abs(H[2, 0]) + wp.abs(H[2, 1]) + wp.abs(H[2, 2])
+        prior_scale = wp.max(wp.max(row0_sum, wp.max(row1_sum, row2_sum)), dtype_scalar(1.0e-8))
+        volume_score = wp.abs(wp.determinant(H)) / (prior_scale * prior_scale * prior_scale)
+        rank_weight = wp.clamp(
+            (dtype_scalar(1.0e-6) - volume_score) / dtype_scalar(1.0e-6),
+            dtype_scalar(0.0),
+            dtype_scalar(1.0),
+        )
+        prior = dtype_scalar(0.05) * rank_weight * prior_scale
+
+        # Identity-gauge only for truly degenerate covariance. This keeps raw NS
+        # behavior for normal SkeletonTransfer cases while avoiding singular
+        # gradients for rank-0/rank-1 inputs.
+        # fmt: off
+        H = dtype_mat(
+            H[0, 0] + prior, H[0, 1], H[0, 2],
+            H[1, 0], H[1, 1] + prior, H[1, 2],
+            H[2, 0], H[2, 1], H[2, 2] + prior,
+        )
+        # fmt: on
+
+        row0_sum = wp.abs(H[0, 0]) + wp.abs(H[0, 1]) + wp.abs(H[0, 2])
+        row1_sum = wp.abs(H[1, 0]) + wp.abs(H[1, 1]) + wp.abs(H[1, 2])
+        row2_sum = wp.abs(H[2, 0]) + wp.abs(H[2, 1]) + wp.abs(H[2, 2])
+        max_sum = wp.max(wp.max(row0_sum, wp.max(row1_sum, row2_sum)), dtype_scalar(1.0e-8))
+        R = H * (dtype_scalar(1.0) / max_sum)
+
+        for _ in range(30):
+            RT_R = wp.transpose(R) * R
+            # fmt: off
+            term = dtype_mat(
+                dtype_scalar(3.0) - RT_R[0, 0], -RT_R[0, 1], -RT_R[0, 2],
+                -RT_R[1, 0], dtype_scalar(3.0) - RT_R[1, 1], -RT_R[1, 2],
+                -RT_R[2, 0], -RT_R[2, 1], dtype_scalar(3.0) - RT_R[2, 2],
+            )
+            # fmt: on
+            R = R * term * dtype_scalar(0.5)
+
+        det = wp.determinant(R)
+        sign_factor = wp.where(det < dtype_scalar(0.0), dtype_scalar(-1.0), dtype_scalar(1.0))
+        # fmt: off
+        R = dtype_mat(
+            R[0, 0], R[0, 1], R[0, 2] * sign_factor,
+            R[1, 0], R[1, 1], R[1, 2] * sign_factor,
+            R[2, 0], R[2, 1], R[2, 2] * sign_factor,
+        )
+        # fmt: on
+        out_rotations[tid] = R
+
+    return compute_rotations_auto
+
+
+_compute_auto_fp16 = _create_newton_schulz_auto_kernel(wp.float16, wp.vec3h, wp.mat33h)
+_compute_auto_fp32 = _create_newton_schulz_auto_kernel(wp.float32, wp.vec3, wp.mat33)
+_compute_auto_fp64 = _create_newton_schulz_auto_kernel(wp.float64, wp.vec3d, wp.mat33d)
+
+
+def _select_rotation_kernel(dtype: torch.dtype, method: AlignmentMethod):
+    if dtype == torch.float16:
+        kernels = {
+            "auto": _compute_auto_fp16,
+            "kabsch": _compute_svd_fp16,
+            "newton-schulz": _compute_newton_schulz_fp16,
+        }
+    elif dtype == torch.float64:
+        kernels = {
+            "auto": _compute_auto_fp64,
+            "kabsch": _compute_svd_fp64,
+            "newton-schulz": _compute_newton_schulz_fp64,
+        }
+    else:
+        kernels = {
+            "auto": _compute_auto_fp32,
+            "kabsch": _compute_svd_fp32,
+            "newton-schulz": _compute_newton_schulz_fp32,
+        }
+    if method not in kernels:
+        raise ValueError(f"Unknown rotation method: {method!r}.")
+    return kernels[method]
 
 
 class RodriguesRotationWarp(torch.autograd.Function):
@@ -519,7 +649,7 @@ class AlignVectorsWarp(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, A_flat, B_flat, offsets, counts, method="newton-schulz"):
+    def forward(ctx, A_flat, B_flat, offsets, counts, method="auto"):
         """
         Forward pass using Warp kernel with tape recording.
 
@@ -528,7 +658,7 @@ class AlignVectorsWarp(torch.autograd.Function):
             B_flat: (total_vectors, 3) - flattened source vectors
             offsets: (batch_size,) int32 - start index for each batch
             counts: (batch_size,) int32 - number of vectors per batch (must be >= 2)
-            method: str - rotation extraction method ('kabsch' or 'newton-schulz')
+            method: str - rotation extraction method ('auto', 'kabsch', or 'newton-schulz')
 
         Returns:
             R: (batch_size, 3, 3) - rotation matrices
@@ -544,19 +674,11 @@ class AlignVectorsWarp(torch.autograd.Function):
         # Select appropriate kernels
         if A_flat.dtype == torch.float16:
             cov_kernel = _compute_covariance_fp16
-            rotation_kernel = (
-                _compute_newton_schulz_fp16 if method == "newton-schulz" else _compute_svd_fp16
-            )
         elif A_flat.dtype == torch.float64:
             cov_kernel = _compute_covariance_fp64
-            rotation_kernel = (
-                _compute_newton_schulz_fp64 if method == "newton-schulz" else _compute_svd_fp64
-            )
         else:
             cov_kernel = _compute_covariance_fp32
-            rotation_kernel = (
-                _compute_newton_schulz_fp32 if method == "newton-schulz" else _compute_svd_fp32
-            )
+        rotation_kernel = _select_rotation_kernel(A_flat.dtype, method)
 
         # Convert to Warp arrays with gradient tracking
         # Use detach().contiguous() to avoid non-leaf tensor warnings
@@ -627,7 +749,7 @@ class AlignVectorsWarp(torch.autograd.Function):
         return grad_A, grad_B, None, None, None  # Added None for method parameter
 
 
-def rodrigues_rotation_warp(A, B):
+def rodrigues_rotation_warp(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
     Compute rotation matrices from vector pairs using Rodrigues formula.
 
@@ -652,11 +774,49 @@ def rodrigues_rotation_warp(A, B):
     return RodriguesRotationWarp.apply(A, B)
 
 
-def align_vectors_warp(A_flat, B_flat, offsets, counts, method="newton-schulz"):
+def _fallback_invalid_ragged_rotations(
+    rotations: torch.Tensor,
+    A_flat: torch.Tensor,
+    B_flat: torch.Tensor,
+    offsets: torch.Tensor,
+    counts: torch.Tensor,
+    method: AlignmentMethod,
+) -> torch.Tensor:
+    """Replace invalid NS-family ragged-batch rotations with PyTorch projections."""
+    if method not in {"auto", "newton-schulz"} or rotations.numel() == 0:
+        return rotations
+
+    from soma.geometry.transforms import align_vectors, rotation_matrices_are_valid
+
+    valid = rotation_matrices_are_valid(rotations)
+    if torch.all(valid):
+        return rotations
+
+    fallback = rotations.clone()
+    bad_indices = torch.nonzero(~valid, as_tuple=False).flatten()
+    for batch_idx in bad_indices.detach().cpu().tolist():
+        start = int(offsets[batch_idx].detach().cpu().item())
+        end = start + int(counts[batch_idx].detach().cpu().item())
+        fallback_method = "auto" if method == "auto" else "kabsch"
+        fallback[batch_idx] = align_vectors(
+            A_flat[start:end],
+            B_flat[start:end],
+            method=fallback_method,
+        )
+    return torch.where(valid[..., None, None], rotations, fallback)
+
+
+def align_vectors_warp(
+    A_flat: torch.Tensor,
+    B_flat: torch.Tensor,
+    offsets: torch.Tensor,
+    counts: torch.Tensor,
+    method: AlignmentMethod = "auto",
+) -> torch.Tensor:
     """
     Differentiable Warp-based batch alignment of vector sets with ragged support.
 
-    Uses Kabsch algorithm (covariance + SVD) or Newton-Schulz iteration for N>=2 point sets.
+    Uses auto, Kabsch, or Newton-Schulz rotation extraction for N>=2 point sets.
     For N=1 cases, use rodrigues_rotation_warp() instead.
 
     Uses Warp kernel with tape for both forward and backward passes.
@@ -670,7 +830,7 @@ def align_vectors_warp(A_flat, B_flat, offsets, counts, method="newton-schulz"):
         B_flat: (total_vectors, 3) torch tensor - flattened source vectors
         offsets: (batch_size,) torch tensor (int32) - start index for each batch
         counts: (batch_size,) torch tensor (int32) - number of vectors per batch (must be >= 2)
-        method: str - rotation extraction method ('kabsch' or 'newton-schulz', default: 'newton-schulz')
+        method: str - rotation extraction method ('auto', 'kabsch', or 'newton-schulz', default: 'auto')
 
     Returns:
         R: (batch_size, 3, 3) rotation matrices such that R @ B ≈ A
@@ -698,7 +858,15 @@ def align_vectors_warp(A_flat, B_flat, offsets, counts, method="newton-schulz"):
         >>> counts = torch.tensor([5, 8, 3], dtype=torch.int32)
         >>> R = align_vectors_warp(A_flat, B_flat, offsets, counts)  # shape: (3, 3, 3)
     """
-    return AlignVectorsWarp.apply(A_flat, B_flat, offsets, counts, method)
+    rotations = AlignVectorsWarp.apply(A_flat, B_flat, offsets, counts, method)
+    return _fallback_invalid_ragged_rotations(
+        rotations,
+        A_flat,
+        B_flat,
+        offsets,
+        counts,
+        method,
+    )
 
 
 class ParallelRodriguesKabschWarp(torch.autograd.Function):
@@ -724,7 +892,7 @@ class ParallelRodriguesKabschWarp(torch.autograd.Function):
         kabsch_offsets,
         kabsch_counts,
         # Method selection
-        method="newton-schulz",
+        method="auto",
     ):
         """
         Forward pass with parallel kernel launches.
@@ -736,7 +904,7 @@ class ParallelRodriguesKabschWarp(torch.autograd.Function):
             kabsch_B_flat: (N2_total, 3) flattened source vectors for Kabsch
             kabsch_offsets: (N2_batches,) offsets for Kabsch ragged batch
             kabsch_counts: (N2_batches,) counts for Kabsch ragged batch
-            method: str - rotation extraction method ('kabsch' or 'newton-schulz', default: 'newton-schulz')
+            method: str - rotation extraction method ('auto', 'kabsch', or 'newton-schulz', default: 'auto')
 
         Returns:
             rodrigues_R: (N1, 3, 3) rotation matrices from Rodrigues
@@ -763,21 +931,13 @@ class ParallelRodriguesKabschWarp(torch.autograd.Function):
         if dtype == torch.float16:
             rodrigues_kernel = _compute_rodrigues_fp16
             cov_kernel = _compute_covariance_fp16
-            rotation_kernel = (
-                _compute_newton_schulz_fp16 if method == "newton-schulz" else _compute_svd_fp16
-            )
         elif dtype == torch.float64:
             rodrigues_kernel = _compute_rodrigues_fp64
             cov_kernel = _compute_covariance_fp64
-            rotation_kernel = (
-                _compute_newton_schulz_fp64 if method == "newton-schulz" else _compute_svd_fp64
-            )
         else:
             rodrigues_kernel = _compute_rodrigues_fp32
             cov_kernel = _compute_covariance_fp32
-            rotation_kernel = (
-                _compute_newton_schulz_fp32 if method == "newton-schulz" else _compute_svd_fp32
-            )
+        rotation_kernel = _select_rotation_kernel(dtype, method)
 
         # Create tape for recording
         tape = wp.Tape()
@@ -946,14 +1106,14 @@ class ParallelRodriguesKabschWarp(torch.autograd.Function):
 
 
 def parallel_rodrigues_kabsch_warp(
-    rodrigues_tgt,
-    rodrigues_src,
-    kabsch_A_flat,
-    kabsch_B_flat,
-    kabsch_offsets,
-    kabsch_counts,
-    method="newton-schulz",
-):
+    rodrigues_tgt: torch.Tensor,
+    rodrigues_src: torch.Tensor,
+    kabsch_A_flat: torch.Tensor,
+    kabsch_B_flat: torch.Tensor,
+    kabsch_offsets: torch.Tensor,
+    kabsch_counts: torch.Tensor,
+    method: AlignmentMethod = "auto",
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Execute Rodrigues and Kabsch rotations in parallel using two CUDA streams.
 
@@ -964,7 +1124,7 @@ def parallel_rodrigues_kabsch_warp(
         kabsch_B_flat: (N2_total, 3) flattened source vectors for Kabsch (can be None if no N>=2 joints)
         kabsch_offsets: (N2_batches,) offsets for Kabsch ragged batch
         kabsch_counts: (N2_batches,) counts for Kabsch ragged batch
-        method: str - rotation extraction method ('kabsch' or 'newton-schulz', default: 'newton-schulz')
+        method: str - rotation extraction method ('auto', 'kabsch', or 'newton-schulz', default: 'auto')
 
     Returns:
         rodrigues_R: (N1, 3, 3) rotation matrices from Rodrigues (empty tensor if no N=1 joints)
@@ -985,7 +1145,7 @@ def parallel_rodrigues_kabsch_warp(
         >>> R1, R2 = parallel_rodrigues_kabsch_warp(tgt1, src1, A_flat, B_flat, offsets, counts)
         >>> # R1.shape: (10, 3, 3), R2.shape: (3, 3, 3)
     """
-    return ParallelRodriguesKabschWarp.apply(
+    rodrigues_R, kabsch_R = ParallelRodriguesKabschWarp.apply(
         rodrigues_tgt,
         rodrigues_src,
         kabsch_A_flat,
@@ -994,3 +1154,12 @@ def parallel_rodrigues_kabsch_warp(
         kabsch_counts,
         method,
     )
+    kabsch_R = _fallback_invalid_ragged_rotations(
+        kabsch_R,
+        kabsch_A_flat,
+        kabsch_B_flat,
+        kabsch_offsets,
+        kabsch_counts,
+        method,
+    )
+    return rodrigues_R, kabsch_R

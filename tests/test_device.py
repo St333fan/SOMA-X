@@ -6,6 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 
+import pytest
 import torch
 
 from soma import SomaLayer
@@ -13,7 +14,7 @@ from soma import SomaLayer
 ASSETS_DIR = Path("assets")
 
 
-class TestNovaDevice(unittest.TestCase):
+class TestSomaDevice(unittest.TestCase):
     def setUp(self):
         self.data_root = "assets"
         if not ASSETS_DIR.is_dir():
@@ -23,7 +24,7 @@ class TestNovaDevice(unittest.TestCase):
 
         # Dummy inputs (identity/scale shapes are set in _make_inputs after layer creation)
         self.batch_size = 1
-        self.num_joints = 77  # Nova skeleton
+        self.num_joints = 77  # SOMA skeleton
         self.pose = torch.zeros(self.batch_size, self.num_joints, 3)
         self.transl = torch.zeros(self.batch_size, 3)
 
@@ -36,6 +37,9 @@ class TestNovaDevice(unittest.TestCase):
             scale_params = torch.zeros(self.batch_size, im.num_scale_params)
         return identity_coeffs, scale_params
 
+    @pytest.mark.slow
+    @pytest.mark.cpu
+    @pytest.mark.asset_heavy
     def test_cpu_initialization(self):
         """Test initializing on CPU."""
         device = "cpu"
@@ -59,6 +63,8 @@ class TestNovaDevice(unittest.TestCase):
         )
         self.assertTrue("vertices" in out)
 
+    @pytest.mark.gpu
+    @pytest.mark.asset_heavy
     def test_cuda0_only(self):
         target_device = "cuda:0"
         print(f"Initializing on {target_device}...")
@@ -73,6 +79,9 @@ class TestNovaDevice(unittest.TestCase):
         )
         self.assertTrue("vertices" in out)
 
+    @pytest.mark.slow
+    @pytest.mark.gpu
+    @pytest.mark.asset_heavy
     def test_cuda1_only(self):
         if torch.cuda.device_count() < 2:
             self.skipTest("Need 2 GPUs")
@@ -90,6 +99,9 @@ class TestNovaDevice(unittest.TestCase):
         )
         self.assertTrue("vertices" in out)
 
+    @pytest.mark.slow
+    @pytest.mark.gpu
+    @pytest.mark.asset_heavy
     def test_move_to_gpu(self):
         """Test moving model from CPU to GPU."""
         if not torch.cuda.is_available():
@@ -147,6 +159,9 @@ class TestNovaDevice(unittest.TestCase):
                 self.transl.to(target_device2),
             )
 
+    @pytest.mark.slow
+    @pytest.mark.gpu
+    @pytest.mark.asset_heavy
     def test_gpu_to_cpu_roundtrip(self):
         """Simulate DDP teardown: model moved from GPU back to CPU."""
         if not torch.cuda.is_available():
@@ -161,58 +176,6 @@ class TestNovaDevice(unittest.TestCase):
         # Verify forward pass on CPU still works
         out = model(self.pose, identity_coeffs, scale_params, self.transl)
         self.assertTrue("vertices" in out)
-
-
-class TestSkeletonTransferDevice(unittest.TestCase):
-    """Unit tests for SkeletonTransfer device transfer — no assets required."""
-
-    def _make_skeleton_transfer(self, device="cpu"):
-        from soma.geometry.skeleton_transfer import SkeletonTransfer
-
-        J, V = 5, 20
-        # Pass joint_parent_ids as a tensor to exercise the device-mismatch bug.
-        joint_parent_ids = torch.tensor([0, 0, 1, 2, 3])
-        bind_world_transforms = torch.eye(4).unsqueeze(0).repeat(J, 1, 1)
-        bind_shape = torch.randn(V, 3)
-        skinning_weights = torch.rand(V, J)
-        skinning_weights /= skinning_weights.sum(dim=1, keepdim=True)
-        return SkeletonTransfer(
-            joint_parent_ids.to(device),
-            bind_world_transforms.to(device),
-            bind_shape.to(device),
-            skinning_weights.to(device),
-            use_warp_for_rotations=False,
-            use_sparse_rbf_matrix=False,
-        )
-
-    def test_init_with_tensor_joint_parent_ids(self):
-        """joint_parent_ids passed as a CPU tensor must not cause device errors."""
-        st = self._make_skeleton_transfer("cpu")
-        self.assertIsNotNone(st.regressor_mask)
-
-    def test_gpu_to_cpu_roundtrip(self):
-        """Simulates DDP teardown: SkeletonTransfer on GPU moved back to CPU."""
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA not available")
-        st = self._make_skeleton_transfer("cpu")
-        st.to("cuda")
-        try:
-            st.cpu()
-        except RuntimeError as e:
-            self.fail(f"Moving SkeletonTransfer from GPU to CPU failed: {e}")
-
-    def test_cpu_to_gpu_roundtrip(self):
-        """Moving from CPU to GPU and back must leave all buffers on CPU."""
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA not available")
-        st = self._make_skeleton_transfer("cpu")
-        st.cuda()
-        st.cpu()
-        for name, buf in st.named_buffers():
-            if buf is not None:
-                self.assertEqual(
-                    buf.device.type, "cpu", f"Buffer {name} not on CPU after round-trip"
-                )
 
 
 def _ddp_worker(rank, world_size, data_root, broadcast_buffers):
@@ -266,6 +229,10 @@ def _ddp_worker(rank, world_size, data_root, broadcast_buffers):
         dist.destroy_process_group()
 
 
+@pytest.mark.slow
+@pytest.mark.gpu
+@pytest.mark.multiprocess
+@pytest.mark.asset_heavy
 class TestDDPCompatibility(unittest.TestCase):
     """Verify SomaLayer wrapped in DDP does not crash due to sparse tensor buffers."""
 

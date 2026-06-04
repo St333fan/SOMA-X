@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Asset download helpers for SOMA-X model data."""
+
 from pathlib import Path
 
 REPO_ID = "nvidia/soma-x"
 
 
-def get_assets_dir(revision="main", cache_dir=None) -> Path:
+def get_assets_dir(revision: str = "main", cache_dir: str | Path | None = None) -> Path:
     """Download (or retrieve from cache) the SOMA asset directory from HuggingFace.
 
     Uses ``huggingface_hub.snapshot_download`` which preserves the repository

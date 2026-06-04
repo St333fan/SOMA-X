@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 import torch
 
@@ -76,7 +76,7 @@ class RadialBasisFunction:
         self,
         source_control_points,
         kernel: str = "thin_plate_spline",
-        kernel_params: Optional[Dict[str, Any]] = None,
+        kernel_params: dict[str, Any] | None = None,
         include_polynomial: bool = True,
     ):
         if kernel not in self.KERNELS:
@@ -128,16 +128,15 @@ class RadialBasisFunction:
         self._lu = torch.linalg.lu_factor(A)
 
     def get_basis_weights(self, query_point):
-        """
-        Computes the linear weights w such that:
-        interpolated_pos = sum(w_i * source_point_i)
+        """Compute linear weights ``w`` such that ``interpolated_pos = sum(w_i * source_point_i)``.
 
         Args:
-        query_point: (D,) Vector representing the static template position
-                        of the joint (or point) being interpolated.
+            query_point: ``(D,)`` vector representing the static template
+                position of the joint (or point) being interpolated.
 
         Returns:
-        weights: (N,) Vector of weights corresponding to the source_control_points.
+            ``(N,)`` vector of weights corresponding to the
+            ``source_control_points``.
         """
         if query_point.ndim == 2:
             query_point = query_point.flatten()
@@ -159,12 +158,15 @@ class RadialBasisFunction:
         return w_full[: self.n_control]
 
     def interpolate(self, target_control_positions, query_points):
-        """
-        target_control_positions: (N, D) or (B, N, D)
-        query_points: (M, D)
+        """Interpolate query points from new control-point positions.
+
+        Args:
+            target_control_positions: ``(N, D)`` or ``(B, N, D)``.
+            query_points: ``(M, D)``.
+
         Returns:
-            (M, D) if input was (N, D)
-            (B, M, D) if input was (B, N, D)
+            ``(M, D)`` if input was ``(N, D)``; ``(B, M, D)`` if input was
+            ``(B, N, D)``.
         """
         N, D = self.n_control, self.dim
 

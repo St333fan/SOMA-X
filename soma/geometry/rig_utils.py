@@ -1,13 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Skeleton hierarchy utilities for converting between local and world frames."""
+
+import logging
+from collections.abc import Sequence
+
 import numpy as np
 import torch
 
 from .transforms import SE3_inverse
 
+logger = logging.getLogger(__name__)
 
-def joint_world_to_local(joint_world_transforms, joint_parent_ids, return_inverse=False):
+
+SkeletonLevels = list[tuple[torch.Tensor, torch.Tensor]]
+
+
+def joint_world_to_local(
+    joint_world_transforms: torch.Tensor,
+    joint_parent_ids: Sequence[int] | torch.Tensor,
+    return_inverse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Convert world space joint transforms to local space (relative to parent).
 
     Args:
@@ -31,6 +45,15 @@ def joint_world_to_local(joint_world_transforms, joint_parent_ids, return_invers
             f"Expected joint_world_transforms to have shape (...,4,4) or (...,3,3); got {joint_world_transforms.shape}"
         )
     joint_local_transforms = inverse_world_transforms[:, joint_parent_ids] @ joint_world_transforms
+    # Fix self-parent root joints: local == world (not identity)
+    pids = (
+        joint_parent_ids
+        if isinstance(joint_parent_ids, torch.Tensor)
+        else torch.tensor(joint_parent_ids, dtype=torch.long)
+    )
+    self_parent = pids == torch.arange(len(pids), device=pids.device)
+    if self_parent.any():
+        joint_local_transforms[:, self_parent] = joint_world_transforms[:, self_parent]
     if return_inverse:
         return (
             joint_local_transforms[0] if added_batch else joint_local_transforms,
@@ -39,7 +62,10 @@ def joint_world_to_local(joint_world_transforms, joint_parent_ids, return_invers
     return joint_local_transforms[0] if added_batch else joint_local_transforms
 
 
-def joint_local_to_world(joint_local_transforms, joint_parent_ids):
+def joint_local_to_world(
+    joint_local_transforms: torch.Tensor,
+    joint_parent_ids: Sequence[int] | torch.Tensor,
+) -> torch.Tensor:
     """Convert local space joint transforms (relative to parent) to world space.
 
     Args:
@@ -75,7 +101,10 @@ def joint_local_to_world(joint_local_transforms, joint_parent_ids):
     return joint_world_transforms[0] if added_batch else joint_world_transforms
 
 
-def compute_skeleton_levels(joint_parent_ids, device=None):
+def compute_skeleton_levels(
+    joint_parent_ids: Sequence[int] | torch.Tensor,
+    device: torch.device | None = None,
+) -> SkeletonLevels:
     """Group joints by tree depth for level-order forward kinematics.
 
     Args:
@@ -114,16 +143,19 @@ def compute_skeleton_levels(joint_parent_ids, device=None):
     return levels
 
 
-def joint_local_to_world_levelorder(joint_local_transforms, levels):
+def joint_local_to_world_levelorder(
+    joint_local_transforms: torch.Tensor,
+    levels: SkeletonLevels,
+) -> torch.Tensor:
     """Batched level-order forward kinematics.
 
-    Equivalent to :func:`joint_local_to_world` but processes all joints at the
+    Equivalent to :obj:`~soma.geometry.rig_utils.joint_local_to_world` but processes all joints at the
     same tree depth in a single batched ``bmm``, reducing ~J sequential kernel
     launches to ~D (number of depth levels, typically 10-12 for humanoids).
 
     Args:
         joint_local_transforms: (J, M, M) or (B, J, M, M) where M = 3 or 4.
-        levels: precomputed output of :func:`compute_skeleton_levels`.
+        levels: precomputed output of :obj:`~soma.geometry.rig_utils.compute_skeleton_levels`.
     Returns:
         joint_world_transforms: same shape as *joint_local_transforms*.
     """
@@ -148,8 +180,11 @@ def joint_local_to_world_levelorder(joint_local_transforms, levels):
     return world[0] if added_batch else world
 
 
-def precompute_joint_orient(joint_orient, joint_parent_ids):
-    """Precompute tensors for :func:`apply_joint_orient_local`.
+def precompute_joint_orient(
+    joint_orient: torch.Tensor,
+    joint_parent_ids: Sequence[int] | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute tensors for :obj:`~soma.geometry.rig_utils.apply_joint_orient_local`.
 
     Args:
         joint_orient: (J, 3, 3) world-space orientation per joint.
@@ -157,14 +192,18 @@ def precompute_joint_orient(joint_orient, joint_parent_ids):
 
     Returns:
         ``(orient, orient_parent_T)`` -- both (J, 3, 3) tensors ready to be
-        passed to :func:`apply_joint_orient_local`.
+        passed to :obj:`~soma.geometry.rig_utils.apply_joint_orient_local`.
     """
     orient = joint_orient[..., :3, :3]
     orient_parent_T = orient[joint_parent_ids].transpose(-2, -1)
     return orient, orient_parent_T
 
 
-def apply_joint_orient_local(local_rotations, orient, orient_parent_T):
+def apply_joint_orient_local(
+    local_rotations: torch.Tensor,
+    orient: torch.Tensor,
+    orient_parent_T: torch.Tensor,
+) -> torch.Tensor:
     """Apply joint orient as a per-joint local operation (no FK loop).
 
     Mathematically equivalent to::
@@ -179,8 +218,8 @@ def apply_joint_orient_local(local_rotations, orient, orient_parent_T):
 
     Args:
         local_rotations: (B, J, 3, 3) local-space rotation matrices.
-        orient: (J, 3, 3) from :func:`precompute_joint_orient`.
-        orient_parent_T: (J, 3, 3) from :func:`precompute_joint_orient`.
+        orient: (J, 3, 3) from :obj:`~soma.geometry.rig_utils.precompute_joint_orient`.
+        orient_parent_T: (J, 3, 3) from :obj:`~soma.geometry.rig_utils.precompute_joint_orient`.
 
     Returns:
         (B, J, 3, 3) oriented local rotations.
@@ -188,8 +227,12 @@ def apply_joint_orient_local(local_rotations, orient, orient_parent_T):
     return orient_parent_T[None] @ local_rotations @ orient[None]
 
 
-def remove_joint_orient_local(local_rotations, orient, orient_parent_T):
-    """Remove joint orient — inverse of :func:`apply_joint_orient_local`.
+def remove_joint_orient_local(
+    local_rotations: torch.Tensor,
+    orient: torch.Tensor,
+    orient_parent_T: torch.Tensor,
+) -> torch.Tensor:
+    """Remove joint orient — inverse of :obj:`~soma.geometry.rig_utils.apply_joint_orient_local`.
 
     Converts absolute local rotations (with orient baked in) back to
     T-pose-relative rotations::
@@ -201,8 +244,8 @@ def remove_joint_orient_local(local_rotations, orient, orient_parent_T):
 
     Args:
         local_rotations: (B, J, 3, 3) absolute local rotations.
-        orient: (J, 3, 3) from :func:`precompute_joint_orient`.
-        orient_parent_T: (J, 3, 3) from :func:`precompute_joint_orient`.
+        orient: (J, 3, 3) from :obj:`~soma.geometry.rig_utils.precompute_joint_orient`.
+        orient_parent_T: (J, 3, 3) from :obj:`~soma.geometry.rig_utils.precompute_joint_orient`.
 
     Returns:
         (B, J, 3, 3) T-pose-relative rotations.
@@ -212,7 +255,7 @@ def remove_joint_orient_local(local_rotations, orient, orient_parent_T):
     return orient_parent[None] @ local_rotations @ orient_T[None]
 
 
-def get_joint_children_ids(joint_parent_ids):
+def get_joint_children_ids(joint_parent_ids: Sequence[int] | torch.Tensor) -> list[list[int]]:
     """Given a list of joint parent IDs, return a list of lists of joint children IDs."""
     parent_ids = (
         joint_parent_ids.tolist() if hasattr(joint_parent_ids, "tolist") else list(joint_parent_ids)
@@ -223,7 +266,9 @@ def get_joint_children_ids(joint_parent_ids):
     return joint_children_ids
 
 
-def get_joint_descendents(joint_parent_ids, joint_id):
+def get_joint_descendents(
+    joint_parent_ids: Sequence[int] | torch.Tensor, joint_id: int
+) -> list[int]:
     """Given a list of joint parent IDs, return a list of all descendents of a given joint ID."""
     children = get_joint_children_ids(joint_parent_ids)
     descendents = []
@@ -238,8 +283,12 @@ def get_joint_descendents(joint_parent_ids, joint_id):
 
 
 def get_body_part_vertex_ids(
-    skinning_weights, joint_parent_ids, root_joint_id, include_root=True, weight_threshold=0.01
-):
+    skinning_weights: torch.Tensor,
+    joint_parent_ids: Sequence[int] | torch.Tensor,
+    root_joint_id: int,
+    include_root: bool = True,
+    weight_threshold: float = 0.01,
+) -> list[int]:
     """Get the vertex IDs influenced by a body part defined by a root joint and its descendents.
 
     Args:
@@ -362,8 +411,9 @@ class PoseMirror_SOMA:
             root_fix = np.diag([-1, 1, 1, 1]).astype(np.float32)
             self._local_adjust_raw[root_index] = root_fix
         else:
-            print(
-                f"Warning: Root joint '{root_name}' not found in joint list. Root rotation fix not applied."
+            logger.warning(
+                "Root joint '%s' not found in joint list. Root rotation fix not applied.",
+                root_name,
             )
 
     def _get_backend_resources(self, sample_input):
@@ -456,11 +506,10 @@ _DEFAULT_MHR_NEGATE_PARAMS = frozenset(
 
 
 class PoseMirror_MHR:
-    """
-    Mirrors MHR parameters across the sagittal plane (YZ plane).
+    """Mirror MHR parameters across the sagittal plane (YZ plane).
 
-    Handles both pose parameters (l_/r_ prefixed) and scale parameters
-    (scale_l_/scale_r_ prefixed), swapping left/right counterparts and
+    Handles both pose parameters (``l_`` / ``r_`` prefixed) and scale parameters
+    (``scale_l_`` / ``scale_r_`` prefixed), swapping left/right counterparts and
     negating parameters that reverse sign under reflection.
 
     Features:

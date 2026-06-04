@@ -8,6 +8,7 @@ This class handles the conversion of MHR shape parameters to SMPL shape paramete
 """
 
 import argparse
+import logging
 from pathlib import Path
 
 import imageio
@@ -21,7 +22,10 @@ from tqdm import tqdm
 from soma.geometry.barycentric_interp import BarycentricInterpolator
 from soma.geometry.batched_skinning import BatchedSkinning
 from soma.soma import SOMALayer
+from tools.logging_utils import add_logging_args, configure_logging
 from tools.vis_pyrender import MeshRenderer, look_at, set_pyopengl_platform
+
+logger = logging.getLogger(__name__)
 
 
 def get_smooth_noise(T, dim, device, num_keyframes=None, mode="normal"):
@@ -72,12 +76,12 @@ class ShapeTransfer(nn.Module):
             self.data_root / "SMPL" / "smpl_base_body.obj", maintain_order=True, process=False
         )
         V_smpl = torch.from_numpy(mesh_smpl.vertices).float().to(self.device)
-        mesh_nv = trimesh.load(
-            self.data_root / "SMPL" / "Nova_wrap.obj", maintain_order=True, process=False
+        mesh_soma = trimesh.load(
+            self.data_root / "SMPL" / "SOMA_wrap.obj", maintain_order=True, process=False
         )
-        V_nv = torch.from_numpy(mesh_nv.vertices).float().to(self.device)
-        F_nv = torch.from_numpy(mesh_nv.faces).int().to(self.device)
-        return BarycentricInterpolator(V_nv, F_nv, V_smpl)
+        V_soma = torch.from_numpy(mesh_soma.vertices).float().to(self.device)
+        F_soma = torch.from_numpy(mesh_soma.faces).int().to(self.device)
+        return BarycentricInterpolator(V_soma, F_soma, V_smpl)
 
     def forward(self, identity_coeffs, scale_params):
         """
@@ -107,7 +111,7 @@ class ShapeTransfer(nn.Module):
 
         vertices, T_world = batched_skinning.pose(
             local_rotations=pose_rotations,
-            hips_translations=pose_translations,
+            global_translation=pose_translations,
             return_transforms=True,
         )
 
@@ -134,7 +138,9 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, default=1920)
     parser.add_argument("--sequence-length", type=int, default=300)
     parser.add_argument("--pyopengl-platform", default="osmesa")
+    add_logging_args(parser)
     args = parser.parse_args()
+    configure_logging(args)
 
     set_pyopengl_platform(args.pyopengl_platform)
 
@@ -159,7 +165,7 @@ if __name__ == "__main__":
     mhr_vertices = mhr_vertices.detach().cpu().numpy()
     faces = shape_transfer.mhr_soma.faces.cpu().numpy()
 
-    print("Rendering videos...")
+    logger.info("Rendering videos...")
     colors = {
         "mhr": (0.98, 0.65, 0.15, 1.0),
         "anny": (0.25, 0.75, 1.0, 1.0),
@@ -168,7 +174,7 @@ if __name__ == "__main__":
 
     def save_video(frames, path, fps=30):
         imageio.mimsave(path, frames, fps=fps)
-        print(f"Saved {path}")
+        logger.info(f"Saved {path}")
 
     renderer = MeshRenderer(image_size=args.image_size, light_intensity=5)
 

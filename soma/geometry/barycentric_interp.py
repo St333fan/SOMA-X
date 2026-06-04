@@ -18,18 +18,22 @@ Example usage:
     >>> V_dst_batch = interp(V_src_batch)  # (batch, n_verts, 3)
 """
 
+from pathlib import Path
+
 import numpy as np
 import torch
 import trimesh
 
 
-def fabricate_tet(p0, p1, p2):
+def fabricate_tet(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
     """
     Fabricate a tetrahedron from triangle vertices by adding a point
     perpendicular to the triangle plane.
 
     Args:
-        p0, p1, p2: Triangle vertices, shape (..., 3)
+        p0: First triangle vertex, shape (..., 3)
+        p1: Second triangle vertex, shape (..., 3)
+        p2: Third triangle vertex, shape (..., 3)
 
     Returns:
         p3: Fourth point of tetrahedron, shape (..., 3)
@@ -39,13 +43,18 @@ def fabricate_tet(p0, p1, p2):
     return p3
 
 
-def compute_barycentric_coords_3d(p, v0, v1, v2, v3):
+def compute_barycentric_coords_3d(
+    p: np.ndarray, v0: np.ndarray, v1: np.ndarray, v2: np.ndarray, v3: np.ndarray
+) -> np.ndarray:
     """
     Compute 3D barycentric coordinates for point p in tetrahedron (v0, v1, v2, v3).
 
     Args:
         p: Query points, shape (..., 3)
-        v0, v1, v2, v3: Tetrahedron vertices, shape (..., 3)
+        v0: First tetrahedron vertex, shape (..., 3)
+        v1: Second tetrahedron vertex, shape (..., 3)
+        v2: Third tetrahedron vertex, shape (..., 3)
+        v3: Fourth tetrahedron vertex, shape (..., 3)
 
     Returns:
         Barycentric coordinates, shape (..., 4)
@@ -64,7 +73,9 @@ def compute_barycentric_coords_3d(p, v0, v1, v2, v3):
     return np.concatenate([b0, b123], axis=-1)  # (..., 4)
 
 
-def barycentric_interpolation(V_tet, F_tet, face_ids, bary_coords):
+def barycentric_interpolation(
+    V_tet: torch.Tensor, F_tet: torch.Tensor, face_ids: torch.Tensor, bary_coords: torch.Tensor
+) -> torch.Tensor:
     """
     Interpolate vertices using precomputed barycentric coordinates.
 
@@ -109,7 +120,13 @@ class BarycentricInterpolator(torch.nn.Module):
     Uses tetrahedral mesh construction and 3D barycentric coordinates.
     """
 
-    def __init__(self, V_src, F_src, V_dst, correspondence_path=None):
+    def __init__(
+        self,
+        V_src: torch.Tensor,
+        F_src: torch.Tensor,
+        V_dst: torch.Tensor,
+        correspondence_path: str | Path | None = None,
+    ) -> None:
         """
         Initialize barycentric interpolator.
 
@@ -143,7 +160,7 @@ class BarycentricInterpolator(torch.nn.Module):
         else:
             self.compute_correspondence()
 
-    def compute_correspondence(self):
+    def compute_correspondence(self) -> None:
         """Compute correspondence using trimesh for closest point queries."""
         # Create trimesh object
         mesh_src = trimesh.Trimesh(vertices=self.V_src, faces=self.F_src)
@@ -180,7 +197,7 @@ class BarycentricInterpolator(torch.nn.Module):
         self.bary_coords = torch.from_numpy(bary_coords).to(self.device)
         self.F_src_tet = torch.from_numpy(F_src_tet).to(self.device).long()
 
-    def load_correspondence(self, path):
+    def load_correspondence(self, path: str | Path) -> None:
         """Load precomputed correspondence from file."""
         correspondence = np.load(path, allow_pickle=False)
         face_ids = correspondence["face_ids"]
@@ -191,7 +208,7 @@ class BarycentricInterpolator(torch.nn.Module):
         self.bary_coords = torch.from_numpy(bary_coords).to(self.device).to(self.dtype)
         self.F_src_tet = torch.from_numpy(F_src_tet).to(self.device).long()
 
-    def save_correspondence(self, path):
+    def save_correspondence(self, path: str | Path) -> None:
         """Save computed correspondence to file."""
         face_ids_np = self.face_ids.detach().cpu().numpy()
         bary_coords_np = self.bary_coords.detach().cpu().numpy()
@@ -200,14 +217,14 @@ class BarycentricInterpolator(torch.nn.Module):
         np.savez(path, face_ids=face_ids_np, bary_coords=bary_coords_np, F_src_tet=F_src_tet_np)
 
     @property
-    def device(self):
+    def device(self) -> torch.device:
         return self.F_src_torch.device
 
     @property
-    def dtype(self):
+    def dtype(self) -> torch.dtype:
         return self.V_src_torch.dtype
 
-    def forward(self, V_src_deformed):
+    def forward(self, V_src_deformed: torch.Tensor) -> torch.Tensor:
         """
         Apply barycentric interpolation to transfer deformation.
 

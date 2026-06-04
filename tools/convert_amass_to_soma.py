@@ -27,6 +27,7 @@ Usage:
 """
 
 import argparse
+import logging
 import random
 import sys
 import time
@@ -43,6 +44,7 @@ from soma.io import add_npz_args, save_soma_npz
 from soma.pose_inversion import PoseInversion
 from soma.soma import SOMALayer
 from soma.units import Unit
+from tools.logging_utils import add_logging_args, configure_logging
 from tools.vis_pyrender import (
     default_pyopengl_platform,
     look_at,
@@ -55,6 +57,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 set_pyopengl_platform(default_pyopengl_platform())
+logger = logging.getLogger(__name__)
 
 
 def load_amass_npz(npz_path):
@@ -74,15 +77,15 @@ def load_amass_npz(npz_path):
     """
     data = np.load(npz_path, allow_pickle=True)
 
-    print(f"\nLoading AMASS data from {npz_path}")
+    logger.info(f"\nLoading AMASS data from {npz_path}")
     keys = list(data.keys())
-    print(f"  Available keys: {keys}")
+    logger.info(f"  Available keys: {keys}")
 
     for key in keys:
         if hasattr(data[key], "shape"):
-            print(f"    {key}: shape={data[key].shape}, dtype={data[key].dtype}")
+            logger.info(f"    {key}: shape={data[key].shape}, dtype={data[key].dtype}")
         else:
-            print(f"    {key}: {type(data[key])} = {data[key]}")
+            logger.info(f"    {key}: {type(data[key])} = {data[key]}")
 
     # AMASS poses[:, :66] = 22 joints x 3 (root + 21 body joints)
     # Pad to 72 = 24 joints x 3 to match SMPL's expected shape
@@ -96,10 +99,10 @@ def load_amass_npz(npz_path):
     gender = str(data["gender"]) if "gender" in data else "neutral"
     fps = float(data["mocap_framerate"]) if "mocap_framerate" in data else 30.0
 
-    print(f"  Sequence length: {T} frames")
-    print(f"  Shape (betas): {betas.shape}")
-    print(f"  Gender: {gender}")
-    print(f"  FPS: {fps}")
+    logger.info(f"  Sequence length: {T} frames")
+    logger.info(f"  Shape (betas): {betas.shape}")
+    logger.info(f"  Gender: {gender}")
+    logger.info(f"  FPS: {fps}")
 
     return {"poses": poses_smpl, "betas": betas, "trans": trans, "gender": gender, "fps": fps}
 
@@ -151,6 +154,8 @@ def convert_amass_sequence(amass_data, args, smpl_model, inv, device="cuda"):
         body_iters=args.body_iters,
         finger_iters=args.finger_iters,
         full_iters=args.full_iters,
+        lie_iters=args.lie_iters,
+        lie_lambda=args.lie_lambda,
         autograd_iters=args.autograd_iters,
         autograd_lr=args.autograd_lr,
     )
@@ -159,11 +164,13 @@ def convert_amass_sequence(amass_data, args, smpl_model, inv, device="cuda"):
     parts = [
         f"body={args.body_iters}, finger={args.finger_iters}, full={args.full_iters}",
     ]
+    if args.lie_iters > 0:
+        parts.append(f"lie-gn={args.lie_iters}, lambda={args.lie_lambda}")
     if args.autograd_iters > 0:
         parts.append(f"autograd={args.autograd_iters}, lr={args.autograd_lr}")
     if args.batch_size:
         parts.append(f"batch_size={batch_size}")
-    print(f"\nInverting {T} frames ({', '.join(parts)})...")
+    logger.info(f"\nInverting {T} frames ({', '.join(parts)})...")
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -186,6 +193,8 @@ def convert_amass_sequence(amass_data, args, smpl_model, inv, device="cuda"):
             body_iters=args.body_iters,
             finger_iters=args.finger_iters,
             full_iters=args.full_iters,
+            lie_iters=args.lie_iters,
+            lie_lambda=args.lie_lambda,
             autograd_iters=args.autograd_iters,
             autograd_lr=args.autograd_lr,
         )
@@ -200,9 +209,9 @@ def convert_amass_sequence(amass_data, args, smpl_model, inv, device="cuda"):
     root_transl = torch.cat(all_root_transl, dim=0)
     err = torch.cat(all_errors, dim=0)
 
-    print(f"  Time: {dt:.3f}s ({T / dt:.0f} fps)")
-    print(f"  Mean vertex error: {err.mean():.6f} m")
-    print(f"  Max vertex error:  {err.max():.6f} m")
+    logger.info(f"  Time: {dt:.3f}s ({T / dt:.0f} fps)")
+    logger.info(f"  Mean vertex error: {err.mean():.6f} m")
+    logger.info(f"  Max vertex error:  {err.max():.6f} m")
 
     return {
         "rotations": rotations,
@@ -286,6 +295,18 @@ def main():
         "--full-iters", type=int, default=1, help="Analytical full iterations (default: 1)."
     )
     parser.add_argument(
+        "--lie-iters",
+        type=int,
+        default=3,
+        help="Lie algebra Gauss-Newton iterations (default: 3).",
+    )
+    parser.add_argument(
+        "--lie-lambda",
+        type=float,
+        default=1e-1,
+        help="Tikhonov regularisation for Lie-GN (default: 1e-1).",
+    )
+    parser.add_argument(
         "--autograd-iters",
         type=int,
         default=0,
@@ -309,8 +330,10 @@ def main():
         default=True,
         help="Skip files whose output already exists (default: on). Use --no-skip-existing to force.",
     )
+    add_logging_args(parser)
     add_npz_args(parser)
     args = parser.parse_args()
+    configure_logging(args)
 
     # Validate argument combinations
     if args.input_dir and not args.output_dir:
@@ -343,7 +366,7 @@ def main():
         npz_files = sorted(input_root.rglob("*.npz"))
 
         if not npz_files:
-            print(f"No .npz files found under {input_root}")
+            logger.warning(f"No .npz files found under {input_root}")
             return
 
         # Pre-filter for skip-existing so the progress bar reflects real work
@@ -366,7 +389,7 @@ def main():
         if args.shuffle:
             random.shuffle(work_items)
 
-        print(
+        logger.info(
             f"Found {len(npz_files)} .npz files under {input_root}"
             f" ({num_skipped} already exist, {len(work_items)} to convert)"
         )
@@ -388,10 +411,13 @@ def main():
                 _save_conversion(conv, inv, args, str(out_path))
                 num_converted += 1
             except Exception as e:
-                tqdm.write(f"FAILED {rel_path}: {e}")
+                logger.warning(f"FAILED {rel_path}: {e}")
                 num_failed += 1
 
-        print(f"\nBatch complete: {num_converted} converted, {num_skipped} skipped, {num_failed} failed")
+        logger.info(
+            f"\nBatch complete: {num_converted} converted, {num_skipped} skipped, "
+            f"{num_failed} failed"
+        )
 
     else:
         # --- Single file mode ---
@@ -449,7 +475,7 @@ def main():
         output_video = (
             args.output_npz.replace(".npz", ".mp4") if args.output_npz else "out/amass2soma.mp4"
         )
-        print("\nRendering comparison video...")
+        logger.info("\nRendering comparison video...")
         # Per-frame centroid from source mesh; apply to both so overlay stays aligned
         smpl_verts_all = np.concatenate(smpl_verts_all, axis=0)
         soma_verts_all = np.concatenate(soma_verts_all, axis=0)

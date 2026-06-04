@@ -1,11 +1,11 @@
-
-
 <p align="center">
   <img src="./assets/images/banner.png" alt="Banner" width="100%">
 </p>
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Technical Report](https://img.shields.io/badge/arXiv-2603.16858-b31b1b.svg)](https://arxiv.org/abs/2603.16858)
+
+Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ## Overview
 
@@ -28,12 +28,12 @@ SOMA currently supports five distinct identity models, each offering unique capa
 2. [Anny](https://github.com/naver/anny): Particularly well-suited for modeling children, broadening applicability to younger subjects.
 3. [SMPL-Family](https://smpl.is.tue.mpg.de/): Supports both SMPL and SMPL-X models, enabling interoperability with established standards in the field.
 4. **SOMA-shape**: A proprietary PCA-based model developed as part of this project, designed to offer SMPL-like functionality with 128 PCA coefficients for identity representation. 
-5. [GarmentMeasurement](https://github.com/mbotsch/GarmentMeasurements): A PCA-based identity model trained on the CAESARS dataset, suitable for specialized use cases involving garment fitting and measurement.
+5. [GarmentMeasurements](https://github.com/mbotsch/GarmentMeasurements): A PCA-based identity model trained on the CAESAR dataset, suitable for specialized use cases involving garment fitting and measurement.
 
 We welcome community contributions to extend support for additional identity models.
 
 ## Unified Pose Correctives (Beta)
-Thanks to SOMA's unified framework, pose-dependent corrective deformations that mitigate LBS artifacts are seamlessly available for all supported identity models, including those that do not provide correctives themselves (e.g., Anny and GarmentMeasurement).
+Thanks to SOMA's unified framework, pose-dependent corrective deformations that mitigate LBS artifacts are seamlessly available for all supported identity models, including those that do not provide correctives themselves (e.g., Anny and GarmentMeasurements).
 <p align="center">
   <img src="assets/images/soma_correctives.gif" alt="SOMA Pose Correctives" width="800"/>
 </p>
@@ -149,7 +149,7 @@ You also need to download `SMPL_NEUTRAL.pkl` or `SMPLX_NEUTRAL.npz` separately:
 uv pip install ".[anny]"
 ```
 
-**For [GarmentMeasurement](https://github.com/mbotsch/GarmentMeasurements) support:**
+**For [GarmentMeasurements](https://github.com/mbotsch/GarmentMeasurements) support:**
 ```bash
 git clone https://github.com/mbotsch/GarmentMeasurements 
 python tools/convert_gm_pca_to_npz.py ./GarmentMeasurements/data/pca/point.pca assets/GarmentMeasurements/point.npz
@@ -159,6 +159,8 @@ rm -rf GarmentMeasurements
 
 
 ## Usage
+
+### Full-body model
 
 ```python
 import torch
@@ -176,7 +178,9 @@ soma = SOMALayer(
 # Forward pass
 # poses: (B, num_joints, 3)
 # identity: (B, num_coeffs)
-# scale_params: (B, num_scales) - Optional, depending on model type (required for MHR)
+# scale_params: (B, soma.num_scale_params) - Optional, depending on model type.
+# For native SOMA bone scales, soma.scale_param_names defines active child joints,
+# and soma.scale_param_segments defines the matching local parent-to-child edges.
 output = soma(poses, identity, scale_params=scale_params)
 vertices = output["vertices"]
 ```
@@ -210,13 +214,17 @@ python tools/demo_soma_vis.py --data-root ./assets --output-dir ./out --identity
 
 # Run MHR with random shapes
 python tools/demo_soma_vis.py --data-root ./assets --output-dir ./out --identity-model-type mhr --random-shape
+
+# Render the extra-low LOD
+python tools/demo_soma_vis.py --data-root ./assets --output-dir ./out --identity-model-type soma,mhr --lod xlo
 ```
 
 This will generate example animation videos for the selected models in the `out/` directory.
 
-**Demo Options:**
-- `--identity-model-type`: Comma-separated list of models to use (options: `soma`, `mhr`, `anny`, `smplx`, `smpl`, `garment`, default: `soma,mhr,anny,smpl,smplx,garment`)
-- `--random-shape`: Generate random body shapes instead of using neutral shapes
+**Full-body demo options:**
+- `--identity-model-type`: Comma-separated list of models (options: `soma`, `mhr`, `anny`, `smplx`, `smpl`, `garment`, default: all)
+- `--lod`: Body mesh LOD to render (`mid`, `low`, or `xlo`; default: `mid`). The `xlo` mesh uses its own USD topology/skinning and uses the v0026 low-LOD mesh for identity skeleton fitting.
+- `--random-shape`: Smoothly animate random body shapes instead of neutral shape
 - `--motion-file`: Path to custom motion file (default: `assets/ROM5.npy`)
 - `--image-size`: Render resolution (default: 1920)
 - `--device`: Device to use (default: `cuda:0`)
@@ -337,7 +345,7 @@ If you use this code in your work, please cite:
 ```bibtex
 @article{soma2026,
   title={SOMA: Unifying Parametric Human Body Models},
-  author={Jun Saito and Jiefeng Li and Michael de Ruyter and Miguel Guerrero and Edy Lim and Ehsan Hassani and Roger Blanco Ribera and Hyejin Moon and Magdalena Dadela and Marco Di Lucca and Qiao Wang and  Xueting Li and Jan Kautz and Simon Yuen and Umar Iqbal},
+  author={Jun Saito and Jiefeng Li and Michael de Ruyter and Miguel Guerrero and Edy Lim and Ehsan Hassani and Roger Blanco Ribera and Hyejin Moon and Magdalena Dadela and Marco Di Lucca and Qiao Wang and Xueting Li and Jan Kautz and Simon Yuen and Umar Iqbal},
   eprint={2603.16858},
   archivePrefix={arXiv},
   year={2026},
@@ -349,7 +357,7 @@ If you use this code in your work, please cite:
 - [SMPL-Body](https://smpl.is.tue.mpg.de/bodylicense.html) was used to create an interpolator between SMPL and SOMA mesh topologies, courtesy of the Max Planck Institute for Intelligent Systems. 
 - [MHR](https://github.com/facebookresearch/MHR) was used to learn the pose corrective model. 
 - [Anny](https://github.com/naver/anny) for [WARP](https://github.com/NVIDIA/warp)-based sparse linear blend skinning.  
-- [GarmentMeasurement](https://github.com/mbotsch/GarmentMeasurements) was used to augment the data in our shape model. 
+- [GarmentMeasurements](https://github.com/mbotsch/GarmentMeasurements) was used to augment the data in our shape model.
 
 
 ## License

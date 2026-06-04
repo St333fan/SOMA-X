@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
@@ -24,12 +25,12 @@ import numpy as np
 import smplx
 import torch
 
-from soma.geometry.rig_utils import remove_joint_orient_local
 from soma.geometry.transforms import matrix_to_rotvec, rotation_6d_to_matrix
-from soma.io import add_npz_args, save_soma_npz
+from soma.io import add_npz_args, export_soma_usd
 from soma.pose_inversion import PoseInversion
 from soma.soma import SOMALayer
-from soma.units import Unit
+from tools.conversion_utils import add_inversion_args, export_soma_npz
+from tools.logging_utils import add_logging_args, configure_logging
 from tools.vis_pyrender import (
     default_pyopengl_platform,
     render_comparison_video,
@@ -41,46 +42,25 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 set_pyopengl_platform(default_pyopengl_platform())
+logger = logging.getLogger(__name__)
 
 
 def main():
     parser = argparse.ArgumentParser(description="SMPL to SOMA pose converter.")
-    parser.add_argument(
-        "--body-iters", type=int, default=2, help="Analytical body iterations (default: 2)."
-    )
-    parser.add_argument(
-        "--finger-iters", type=int, default=0, help="Analytical finger iterations (default: 0)."
-    )
-    parser.add_argument(
-        "--full-iters", type=int, default=1, help="Analytical full iterations (default: 1)."
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Process frames in chunks of this size (default: all at once).",
-    )
+    add_inversion_args(parser, batch_size=None, autograd=True)
     parser.add_argument(
         "--subsample", type=int, default=4, help="Frame subsampling factor (default: 4)."
     )
-    parser.add_argument(
-        "--autograd-iters",
-        type=int,
-        default=0,
-        help="Autograd FK refinement iterations after analytical solve (default: 0 = off).",
-    )
-    parser.add_argument(
-        "--autograd-lr",
-        type=float,
-        default=5e-3,
-        help="Learning rate for autograd FK (default: 5e-3).",
-    )
     parser.add_argument("--no-render", action="store_true", help="Skip video rendering.")
+    parser.add_argument("--output-usd", default=None, help="Output .usd/.usda/.usdc with UsdSkel.")
+    parser.add_argument("--fps", type=int, default=30, help="Output video/USD FPS (default: 30).")
+    add_logging_args(parser)
     add_npz_args(parser)
     args = parser.parse_args()
+    configure_logging(args)
 
-    device = "cuda"
-    data_root = repo_root / "assets"
+    device = args.device
+    data_root = Path(args.data_root) if args.data_root else repo_root / "assets"
 
     # --- Load SMPL animation ---
     data_path = data_root / "SMPL" / "smpl_anim.npy"
@@ -101,7 +81,7 @@ def main():
     betas = betas[idx]
     transl = transl[idx]
     num_frames = len(idx)
-    print(f"Loaded {num_frames} frames (subsampled {args.subsample}x from {seq_len})")
+    logger.info(f"Loaded {num_frames} frames (subsampled {args.subsample}x from {seq_len})")
 
     # --- Set up SMPL model ---
     smpl_model = smplx.create(
@@ -128,11 +108,13 @@ def main():
     parts = [
         f"body={args.body_iters}, finger={args.finger_iters}, full={args.full_iters}",
     ]
+    if args.lie_iters > 0:
+        parts.append(f"lie-gn={args.lie_iters}, lambda={args.lie_lambda}")
     if args.autograd_iters > 0:
         parts.append(f"autograd={args.autograd_iters}, lr={args.autograd_lr}")
     if args.batch_size:
         parts.append(f"batch_size={batch_size}")
-    print(f"\nInverting ({', '.join(parts)})...")
+    logger.info(f"\nInverting ({', '.join(parts)})...")
 
     # Warmup
     with torch.no_grad():
@@ -147,6 +129,8 @@ def main():
         body_iters=args.body_iters,
         finger_iters=args.finger_iters,
         full_iters=args.full_iters,
+        lie_iters=args.lie_iters,
+        lie_lambda=args.lie_lambda,
         autograd_iters=args.autograd_iters,
         autograd_lr=args.autograd_lr,
     )
@@ -172,6 +156,8 @@ def main():
             body_iters=args.body_iters,
             finger_iters=args.finger_iters,
             full_iters=args.full_iters,
+            lie_iters=args.lie_iters,
+            lie_lambda=args.lie_lambda,
             autograd_iters=args.autograd_iters,
             autograd_lr=args.autograd_lr,
         )
@@ -186,37 +172,31 @@ def main():
     root_transl = torch.cat(all_root_transl, dim=0)
     err = torch.cat(all_errors, dim=0)
 
-    print(f"  Time: {dt:.3f}s ({num_frames / dt:.0f} fps)")
-    print(f"  Mean vertex error: {err.mean():.6f} m")
-    print(f"  Max vertex error:  {err.max():.6f} m")
+    logger.info(f"  Time: {dt:.3f}s ({num_frames / dt:.0f} fps)")
+    logger.info(f"  Mean vertex error: {err.mean():.6f} m")
+    logger.info(f"  Max vertex error:  {err.max():.6f} m")
 
     # --- Save NPZ if requested ---
     if args.output_npz:
-        _soma = inv.soma
-        # Convert absolute → relative, matrix → rotvec
-        rel_rotations = remove_joint_orient_local(
-            rotations, _soma._t_pose_orient, _soma._t_pose_orient_parent_T
-        )
-        poses_rotvec = matrix_to_rotvec(rel_rotations.reshape(-1, 3, 3)).reshape(
-            rotations.shape[0], rotations.shape[1], 3
-        )
-
-        save_transl = root_transl.clone()
-        target_unit = Unit.from_name(args.output_unit)
-        unit_scale = _soma.output_unit.meters_per_unit / target_unit.meters_per_unit
-        if unit_scale != 1.0:
-            save_transl = save_transl * unit_scale
-
-        save_soma_npz(
+        export_soma_npz(
             args.output_npz,
-            poses_rotvec,
-            save_transl,
-            joint_names=list(_soma.rig_data["joint_names"]),
-            identity_model_type=_soma.identity_model_type,
-            identity_coeffs=betas[:1],
-            joint_orient=_soma._t_pose_orient,
-            unit=args.output_unit,
+            rotations,
+            root_transl,
+            inv.soma,
+            output_unit=args.output_unit,
             keep_root=args.keep_root,
+            identity_coeffs=betas[:1],
+        )
+
+    if args.output_usd:
+        # Prepare full-res soma with fitted identity for USD export
+        soma.prepare_identity(betas[:1])
+        export_soma_usd(
+            args.output_usd,
+            soma,
+            rotations,
+            root_transl,
+            fps=float(args.fps),
         )
 
     if args.no_render:
@@ -254,9 +234,15 @@ def main():
             )
         soma_verts_all.append(sv.detach().cpu().numpy())
 
-    print("\nRendering comparison video...")
+    tag_parts = [f"analytical_b{args.body_iters}f{args.full_iters}"]
+    if args.lie_iters > 0:
+        tag_parts.append(f"lie{args.lie_iters}")
+    if args.autograd_iters > 0:
+        tag_parts.append(f"ag{args.autograd_iters}")
+    out_name = "out/smpl2soma_" + "_".join(tag_parts) + ".mp4"
+    logger.info(f"\nRendering comparison video -> {out_name}")
     render_comparison_video(
-        "out/smpl2soma_test.mp4",
+        out_name,
         np.concatenate(smpl_verts_all, axis=0),
         smpl_faces,
         np.concatenate(soma_verts_all, axis=0),

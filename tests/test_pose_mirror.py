@@ -4,7 +4,7 @@
 """Mesh-level validation of PoseMirror_SOMA and PoseMirror_MHR.
 
 For each mirror class, compares the parameter-mirrored mesh against a geometric
-mesh mirror (flip X + mirror_vert_indices) in Nova topology, excluding facial
+mesh mirror (flip X + mirror_vert_indices) in SOMA topology, excluding facial
 inner geometry.
 
 Pose data paths are resolved exclusively from environment variables.
@@ -12,8 +12,8 @@ Tests skip gracefully when the variables are not set or the data is unavailable,
 so CI and external users are unaffected.
 
 Environment variables:
-    SOMA_POSE_NPZ  Path to a single Nova pose .npz file (key: pose_local or transforms).
-    SOMA_POSE_DIR  Directory of Nova pose .npz files (first file is used).
+    SOMA_POSE_NPZ  Path to a single SOMA pose .npz file (key: pose_local or transforms).
+    SOMA_POSE_DIR  Directory of SOMA pose .npz files (first file is used).
     MHR_POSE_NPZ   Path to a single MHR pose .npz file (key: pose_params).
     MHR_POSE_DIR    Directory of MHR pose .npz files (first file is used).
 
@@ -21,8 +21,6 @@ Usage:
     SOMA_POSE_NPZ="path/to/soma_pose.npz" MHR_POSE_NPZ="path/to/mhr_pose.npz" \
         pytest tests/test_pose_mirror.py -v
 """
-
-from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -35,6 +33,8 @@ from scipy.sparse import csc_matrix
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSETS_DIR = REPO_ROOT / "assets"
 CORE_ASSET = ASSETS_DIR / "SOMA_neutral.npz"
+TEMPLATE_RIG = ASSETS_DIR / "SOMA_template_rig.usda"
+PROCEDURAL_DEFINITION = ASSETS_DIR / "SOMA_procedural_transforms.json"
 
 MAX_FRAMES = 100
 BATCH_SIZE = 64
@@ -83,19 +83,35 @@ def device():
 
 @pytest.fixture(scope="module")
 def soma_rig(device):
-    """Load Nova rig data needed for mesh-level mirror comparison."""
+    """Load SOMA rig data needed for mesh-level mirror comparison."""
     if not CORE_ASSET.is_file():
         pytest.skip(
             f"Core asset not found: {CORE_ASSET}. Run `git lfs pull` to fetch LFS-tracked files."
         )
+    if not TEMPLATE_RIG.is_file():
+        pytest.skip(
+            f"Template rig not found: {TEMPLATE_RIG}. Run `git lfs pull` to fetch LFS-tracked files."
+        )
 
-    rig_data = np.load(CORE_ASSET, allow_pickle=False)
+    from soma.io import load_lod_rig_from_usd
+    from soma.procedural_transforms import (
+        derive_soma_rig_without_procedural_joints,
+        load_soma_procedural_transform_definition,
+    )
 
-    if "mirror_vert_indices" not in rig_data:
+    core_data = np.load(CORE_ASSET, allow_pickle=False)
+
+    if "mirror_vert_indices" not in core_data:
         pytest.skip(
             "SOMA_neutral.npz does not contain 'mirror_vert_indices'. "
             "Either update the NPZ or point the test at an NPZ that includes it."
         )
+    definition = load_soma_procedural_transform_definition(PROCEDURAL_DEFINITION)
+    rig_data = derive_soma_rig_without_procedural_joints(
+        load_lod_rig_from_usd(TEMPLATE_RIG, "mid"),
+        definition.public_joint_names,
+        segments=definition.segments,
+    )
 
     sw_sp = csc_matrix(
         (
@@ -108,8 +124,8 @@ def soma_rig(device):
 
     facial_inner = np.concatenate(
         [
-            rig_data["segment_eye_bags"],
-            rig_data["segment_mouth_bag"],
+            core_data["segment_eye_bags"],
+            core_data["segment_mouth_bag"],
         ]
     )
     body_mask = np.ones(len(rig_data["bind_shape"]), dtype=bool)
@@ -123,7 +139,7 @@ def soma_rig(device):
         bind_pose_world=torch.from_numpy(rig_data["bind_pose_world"]).to(device),
         bind_shape=torch.from_numpy(rig_data["bind_shape"]).to(device),
         skinning_weights=torch.from_numpy(np.array(sw_sp)).to(device),
-        mirror_vert_indices=rig_data["mirror_vert_indices"],
+        mirror_vert_indices=core_data["mirror_vert_indices"],
         body_mask=body_mask,
     )
 
@@ -145,7 +161,7 @@ def test_soma_pose_mirror(device, soma_rig):
 
     npz_path = _resolve_npz_path("SOMA_POSE_NPZ", "SOMA_POSE_DIR")
     if npz_path is None:
-        pytest.skip("Nova pose data not available (set SOMA_POSE_NPZ or SOMA_POSE_DIR)")
+        pytest.skip("SOMA pose data not available (set SOMA_POSE_NPZ or SOMA_POSE_DIR)")
 
     soma_npz = np.load(npz_path)
     key = "pose_local" if "pose_local" in soma_npz else "transforms"

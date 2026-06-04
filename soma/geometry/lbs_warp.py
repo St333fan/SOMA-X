@@ -50,20 +50,23 @@ Export example:
     torch.export.save(exported, "lbs.pt2")
 """
 
+from typing import Any
+
 import torch
 import warp as wp
 
-from soma.geometry._warp_init import ensure_warp_initialized
+from soma._warp_utils import cache_warp_kernel, ensure_warp_initialized
 
 
+@cache_warp_kernel
 def get_kernel(
-    max_bones_count,
-    vertices_scalar_dtype,
-    weights_dtype,
-    indices_dtype,
-    vec3_dtype=wp.vec3,
-    mat44_dtype=wp.mat44,
-):
+    max_bones_count: int,
+    vertices_scalar_dtype: Any,
+    weights_dtype: Any,
+    indices_dtype: Any,
+    vec3_dtype: Any = wp.vec3,
+    mat44_dtype: Any = wp.mat44,
+) -> Any:
     """
     Generate the kernel for linear blend skinning.
     """
@@ -281,7 +284,12 @@ _lbs_custom_op_forward.register_autograd(
 )
 
 
-def linear_blend_skinning(vertices, bone_weights, bone_indices, bone_transforms):
+def linear_blend_skinning(
+    vertices: torch.Tensor,
+    bone_weights: torch.Tensor,
+    bone_indices: torch.Tensor,
+    bone_transforms: torch.Tensor,
+) -> torch.Tensor:
     """
     Apply linear blend skinning to vertices using bone weights and transforms.
 

@@ -1,17 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Identity-model backends and topology-transfer helpers for SOMA-X."""
+
+import logging
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import trimesh
 
+from ._smpl_family_loader import load_smpl_family_model
 from .geometry.barycentric_interp import BarycentricInterpolator
 from .geometry.laplacian import LaplacianMesh
 from .units import Unit
+
+logger = logging.getLogger(__name__)
 
 
 class CoordAxis:
@@ -52,9 +60,11 @@ class NonPersistentModuleWrapper(nn.Module):
         self.module = module
 
     def forward(self, *args, **kwargs):
+        """Delegate the forward pass to the wrapped module."""
         return self.module(*args, **kwargs)
 
     def state_dict(self, destination=None, prefix="", keep_vars=False):
+        """Return an empty state dict so wrapped weights stay non-persistent."""
         if destination is None:
             destination = {}
         return destination
@@ -63,20 +73,20 @@ class NonPersistentModuleWrapper(nn.Module):
         return
 
     def load_state_dict(self, state_dict, strict=True):
+        """Pretend-load state without reporting missing wrapped-module weights."""
         return torch.nn.modules.module._IncompatibleKeys([], [])
 
 
 class SMPLSimplified(nn.Module):
-    """Wrapper around SMPL/SMPLX/SMPLH to simplify the forward pass"""
+    """Minimal SMPL-family shape model for identity-only forward passes."""
 
-    def __init__(self, smpl_model, device):
+    def __init__(self, model_data: dict[str, np.ndarray], device):
         super().__init__()
-        self.smpl_model = smpl_model
         self.device = device
-        self.faces = smpl_model.faces
-        self.v_template = self.smpl_model.v_template
-        self.shape_dirs = self.smpl_model.shapedirs
-        self.num_betas = smpl_model.num_betas
+        self.faces = model_data["faces"]
+        self.v_template = torch.from_numpy(model_data["v_template"]).float().to(device)
+        self.shape_dirs = torch.from_numpy(model_data["shapedirs"]).float().to(device)
+        self.num_betas = self.shape_dirs.shape[2]
 
     def forward(self, betas=None):
         blend_shape = torch.einsum("bl,mkl->bmk", [betas, self.shape_dirs])
@@ -125,8 +135,8 @@ class BaseIdentityModel(nn.Module, ABC):
     """Abstract base class for identity models.
 
     Each subclass **must** declare its native length unit via a ``NATIVE_UNIT``
-    class attribute (a :class:`Unit` enum member).  Omitting it raises
-    :class:`TypeError` at construction time.
+    class attribute (a :obj:`~soma.units.Unit` enum member).  Omitting it raises
+    ``TypeError`` at construction time.
 
     All internal computation (``get_rest_shape``, ``identity_model_to_soma``,
     LaplacianMesh) operates in native units.  The conversion to the caller's
@@ -169,17 +179,22 @@ class BaseIdentityModel(nn.Module, ABC):
 
     @property
     @abstractmethod
-    def num_identity_coeffs(self):
+    def num_identity_coeffs(self) -> int:
         """Number of identity coefficients expected by ``get_rest_shape``."""
         ...
 
     @property
-    def num_scale_params(self):
+    def num_scale_params(self) -> int | None:
         """Number of scale parameters expected by ``get_rest_shape``, or ``None`` if unused."""
         return None
 
     @abstractmethod
-    def get_rest_shape(self, identity_coeffs, scale_params=None, kwargs=None):
+    def get_rest_shape(
+        self,
+        identity_coeffs: torch.Tensor,
+        scale_params: torch.Tensor | None = None,
+        kwargs: Mapping[str, Any] | None = None,
+    ) -> torch.Tensor:
         """Return the rest shape in NATIVE_UNIT scale."""
         pass
 
@@ -202,13 +217,21 @@ class BaseIdentityModel(nn.Module, ABC):
         mouth bag) and the excluded vertices need to be solved via a Laplacian
         system to blend smoothly with the surrounding surface.
         All vertex data must be in the model's native units.
+
+        When *vertex_ids_to_exclude* is ``None`` or empty, no Laplacian
+        blending is needed and only barycentric interpolation is used.
         """
         self._to_soma_interp = BarycentricInterpolator(V_source, F_source, V_soma)
-        mask_anchors = torch.ones(V_soma.shape[0], dtype=torch.bool, device=self.device)
-        mask_anchors[vertex_ids_to_exclude] = False
-        self._laplacian_mesh = LaplacianMesh(V_soma, F_soma, mask_anchors=mask_anchors)
+        if vertex_ids_to_exclude is None or (
+            hasattr(vertex_ids_to_exclude, "__len__") and len(vertex_ids_to_exclude) == 0
+        ):
+            self._laplacian_mesh = None
+        else:
+            mask_anchors = torch.ones(V_soma.shape[0], dtype=torch.bool, device=self.device)
+            mask_anchors[vertex_ids_to_exclude] = False
+            self._laplacian_mesh = LaplacianMesh(V_soma, F_soma, mask_anchors=mask_anchors)
 
-    def identity_model_to_soma(self, identity_rest_shape):
+    def identity_model_to_soma(self, identity_rest_shape: torch.Tensor) -> torch.Tensor:
         """Transform from source topology to SOMA topology (with optional Laplacian blending)."""
         if hasattr(self, "_to_soma_interp"):
             soma_verts = self._to_soma_interp(identity_rest_shape)
@@ -231,7 +254,14 @@ class BaseIdentityModel(nn.Module, ABC):
         fwd = verts[..., fwd_idx : fwd_idx + 1] * fwd_sign
         return torch.cat([right, up, fwd], dim=-1)
 
-    def forward(self, identity_coeffs, scale_params=None, kwargs=None, global_scale=1.0):
+    def forward(
+        self,
+        identity_coeffs: torch.Tensor,
+        scale_params: torch.Tensor | None = None,
+        kwargs: Mapping[str, Any] | None = None,
+        global_scale: float | torch.Tensor = 1.0,
+    ) -> torch.Tensor:
+        """Generate a SOMA-topology rest shape in the requested output unit."""
         identity_rest_shape = self.get_rest_shape(identity_coeffs, scale_params, kwargs)
         result = self.identity_model_to_soma(identity_rest_shape)
         result = self._apply_coord_transform(result)
@@ -250,11 +280,11 @@ class MHRIdentityModel(BaseIdentityModel):
     NATIVE_FORWARD = CoordAxis.Z
 
     @property
-    def num_identity_coeffs(self):
+    def num_identity_coeffs(self) -> int:
         return 45
 
     @property
-    def num_scale_params(self):
+    def num_scale_params(self) -> int | None:
         # 68 body-part scales.  The MHR TorchScript model expects 204
         # model_parameters = 136 pose + 68 scale.
         return 68
@@ -286,11 +316,28 @@ class MHRIdentityModel(BaseIdentityModel):
             V_mhr, F_mhr, V_soma, F_soma, vertex_ids_to_exclude
         )
 
-    def get_rest_shape(self, identity_coeffs, scale_params=None, kwargs=None):
-        """Return the rest shape in centimeters (native MHR unit)."""
+    def get_rest_shape(
+        self,
+        identity_coeffs: torch.Tensor,
+        scale_params: torch.Tensor | None = None,
+        kwargs: Mapping[str, Any] | None = None,
+    ) -> torch.Tensor:
+        """Return the rest shape in centimeters (native MHR unit).
+
+        Args:
+            identity_coeffs: (B, 45) shape coefficients.
+            scale_params: (B, 68) body-part scales (required).
+            kwargs: optional dict. Supports:
+                ``bone_length_flexibles``: (B, 6) tensor injected into
+                pose_params[130:136]. These modify skeleton bone lengths
+                (spine, neck, shoulder, arm, hip, leg) and are identity-like
+                but stored in MHR's pose vector.
+        """
         assert scale_params is not None, "scale_params is required for MHR"
         B = identity_coeffs.shape[0]
         pose_params = torch.zeros(B, 136).to(identity_coeffs.device)
+        if kwargs is not None and "bone_length_flexibles" in kwargs:
+            pose_params[:, 130:136] = kwargs["bone_length_flexibles"]
         face_expr_params = torch.zeros(B, 72).to(identity_coeffs.device)
         identity_rest_shape, _ = self.identity_model(
             identity_coeffs,
@@ -306,7 +353,7 @@ class AnnyIdentityModel(BaseIdentityModel):
     NATIVE_FORWARD = CoordAxis.NEG_Y
 
     @property
-    def num_identity_coeffs(self):
+    def num_identity_coeffs(self) -> int:
         return len(self.identity_model.phenotype_labels)
 
     def __init__(self, data_root, low_lod, device, **kwargs):
@@ -333,7 +380,12 @@ class AnnyIdentityModel(BaseIdentityModel):
         V_soma, _ = self._apply_soma_lod(V_soma)
         self._setup_topology_transfer(V_anny, F_anny, V_soma)
 
-    def get_rest_shape(self, identity_coeffs, scale_params=None, kwargs=None):
+    def get_rest_shape(
+        self,
+        identity_coeffs: torch.Tensor,
+        scale_params: torch.Tensor | None = None,
+        kwargs: Mapping[str, Any] | None = None,
+    ) -> torch.Tensor:
         rest_shape = self.identity_model(
             phenotype_kwargs=identity_coeffs, local_changes_kwargs=scale_params
         )
@@ -346,49 +398,32 @@ class SMPLIdentityModel(BaseIdentityModel):
     NATIVE_FORWARD = CoordAxis.Z
 
     @property
-    def num_identity_coeffs(self):
+    def num_identity_coeffs(self) -> int:
         return self.identity_model.num_betas
 
     def __init__(self, data_root, low_lod, device, model_type="smpl", **kwargs):
         vertex_ids_to_exclude = kwargs.pop("vertex_ids_to_exclude", None)
-        smpl_kwargs = {
-            k: v
-            for k, v in kwargs.items()
-            if k not in ("output_unit", "nv_lod_mid_to_low", "soma_low_lod_faces", "model_path")
-        }
-        super().__init__(data_root, low_lod, device, **kwargs)
-
-        try:
-            import smplx
-        except ImportError as e:
-            raise ImportError(
-                "SMPL/SMPL-X support requires 'smplx' and 'chumpy'. Install with:\n"
-                "  pip install smplx\n"
-                "  pip install --no-build-isolation chumpy\n"
-                "If that fails, install chumpy from source:\n"
-                "  pip install --no-build-isolation git+https://github.com/mattloper/chumpy@580566eafc9ac68b2614b64d6f7aaa8"
-            ) from e
-
         imt = model_type
-        model_kwargs = smpl_kwargs if smpl_kwargs else {}
         gender = kwargs.pop("gender", "neutral")
         explicit_model_path = kwargs.pop("model_path", None)
+        num_betas = int(kwargs.pop("num_betas", 10))
+        super().__init__(data_root, low_lod, device, **kwargs)
 
         if explicit_model_path is not None:
             model_path = Path(explicit_model_path).expanduser()
             if not model_path.exists():
                 raise FileNotFoundError(f"SMPL model not found at '{model_path}'")
-            print(f"Loading {imt.upper()} model from {model_path}")
+            logger.info("Loading %s model from %s", imt.upper(), model_path)
         else:
             model_dir = self.data_root / imt.upper()
             model_path_npz = model_dir / f"{imt.upper()}_{gender.upper()}.npz"
             model_path_pkl = model_dir / f"{imt.upper()}_{gender.upper()}.pkl"
             if model_path_npz.exists():
                 model_path = model_path_npz
-                print(f"Loading {imt.upper()} model from {model_path_npz}")
+                logger.info("Loading %s model from %s", imt.upper(), model_path_npz)
             elif model_path_pkl.exists():
                 model_path = model_path_pkl
-                print(f"Loading {imt.upper()} model from {model_path_pkl}")
+                logger.info("Loading %s model from %s", imt.upper(), model_path_pkl)
             else:
                 raise FileNotFoundError(
                     f"Neither {model_path_npz} nor {model_path_pkl} found. Cannot load {imt.upper()} model.\n"
@@ -396,15 +431,12 @@ class SMPLIdentityModel(BaseIdentityModel):
                     f"<data_root>/{imt.upper()}/."
                 )
 
-        smpl_base_model = smplx.create(
+        model_data = load_smpl_family_model(
+            model_path,
             model_type=imt,
-            model_path=model_path,
-            device=self.device,
-            ext=model_path.suffix[1:],
-            **model_kwargs,
-        ).to(self.device)
-
-        self.identity_model = SMPLSimplified(smpl_base_model, self.device)
+            num_betas=num_betas,
+        )
+        self.identity_model = SMPLSimplified(model_data, self.device)
 
         mesh_smpl = trimesh.load(
             self.data_root / imt.upper() / "base_body.obj",
@@ -423,7 +455,12 @@ class SMPLIdentityModel(BaseIdentityModel):
             V_smpl, F_smpl, V_soma, F_soma, vertex_ids_to_exclude
         )
 
-    def get_rest_shape(self, identity_coeffs, scale_params=None, kwargs=None):
+    def get_rest_shape(
+        self,
+        identity_coeffs: torch.Tensor,
+        scale_params: torch.Tensor | None = None,
+        kwargs: Mapping[str, Any] | None = None,
+    ) -> torch.Tensor:
         rest_shape = self.identity_model(identity_coeffs)
         return rest_shape
 
@@ -434,7 +471,7 @@ class GarmentMeasurementIdentityModel(BaseIdentityModel):
     NATIVE_FORWARD = CoordAxis.Z
 
     @property
-    def num_identity_coeffs(self):
+    def num_identity_coeffs(self) -> int:
         return self.eigenvalues.shape[0]
 
     def __init__(self, data_root, low_lod, device, **kwargs):
@@ -466,7 +503,12 @@ class GarmentMeasurementIdentityModel(BaseIdentityModel):
             V_garment_from_pca, F_garment, V_soma, F_soma, vertex_ids_to_exclude
         )
 
-    def get_rest_shape(self, identity_coeffs, scale_params=None, kwargs=None):
+    def get_rest_shape(
+        self,
+        identity_coeffs: torch.Tensor,
+        scale_params: torch.Tensor | None = None,
+        kwargs: Mapping[str, Any] | None = None,
+    ) -> torch.Tensor:
         weighted_coeffs = identity_coeffs * torch.sqrt(self.eigenvalues)
         weighted_pcas = torch.matmul(weighted_coeffs, self.pca_matrix.T)
         shape_garment = self.pca_mean.unsqueeze(0) + weighted_pcas
@@ -480,7 +522,7 @@ class SOMAIdentityModel(BaseIdentityModel):
     NATIVE_FORWARD = CoordAxis.Z
 
     @property
-    def num_identity_coeffs(self):
+    def num_identity_coeffs(self) -> int:
         return self.eigenvalues.shape[0]
 
     def __init__(self, data_root, low_lod, device, **kwargs):
@@ -489,23 +531,54 @@ class SOMAIdentityModel(BaseIdentityModel):
         self.pca_npz_file = self.data_root / "SOMA_neutral.npz"
 
         data = np.load(self.pca_npz_file, allow_pickle=False)
-        self.pca_matrix = torch.from_numpy(data["shapedirs"]).float().to(device).T
-        self.pca_mean = torch.from_numpy(data["mean"]).float().to(device).flatten()
-        self.eigenvalues = torch.from_numpy(data["eigenvalues"]).float().to(device)
+        mean = data["mean"]
+        shapedirs = data["shapedirs"].reshape(data["shapedirs"].shape[0], -1, 3)
+        self._pca_is_lod_subset = self._nv_lod_mid_to_low is not None
+        if self._pca_is_lod_subset:
+            lod_indices = self._nv_lod_mid_to_low.detach().cpu().numpy()
+            mean = mean[lod_indices]
+            shapedirs = shapedirs[:, lod_indices, :]
+        shapedirs = np.ascontiguousarray(shapedirs.reshape(shapedirs.shape[0], -1))
+        mean = np.ascontiguousarray(mean)
+        self.register_buffer(
+            "pca_matrix",
+            torch.from_numpy(shapedirs).float().to(device).T,
+            persistent=False,
+        )
+        self.register_buffer(
+            "pca_mean",
+            torch.from_numpy(mean).float().to(device).flatten(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "eigenvalues",
+            torch.from_numpy(data["eigenvalues"]).float().to(device),
+            persistent=False,
+        )
 
-    def get_rest_shape(self, identity_coeffs, scale_params=None, kwargs=None):
+    def get_rest_shape(
+        self,
+        identity_coeffs: torch.Tensor,
+        scale_params: torch.Tensor | None = None,
+        kwargs: Mapping[str, Any] | None = None,
+    ) -> torch.Tensor:
         weighted_coeffs = identity_coeffs * torch.sqrt(self.eigenvalues)
         weighted_pcas = torch.matmul(weighted_coeffs, self.pca_matrix.T)
         shape_soma = self.pca_mean.unsqueeze(0) + weighted_pcas
         shape_soma = shape_soma.reshape(identity_coeffs.shape[0], -1, 3)
-        if self._nv_lod_mid_to_low is not None:
+        if self._nv_lod_mid_to_low is not None and not self._pca_is_lod_subset:
             shape_soma = shape_soma[:, self._nv_lod_mid_to_low, :]
         return shape_soma
 
 
 def create_identity_model(
-    identity_model_type, data_root, low_lod, device, output_unit=Unit.METERS, **kwargs
-):
+    identity_model_type: str,
+    data_root,
+    low_lod: bool,
+    device,
+    output_unit: Unit = Unit.METERS,
+    **kwargs: Any,
+) -> BaseIdentityModel:
     """Factory function to create the appropriate identity model.
 
     Args:

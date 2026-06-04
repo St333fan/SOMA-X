@@ -1,10 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Sparse Laplacian construction and Laplacian mesh editing helpers."""
+
+from typing import Literal
+
 import torch
 
+LaplacianConstraintMode = Literal["hard", "soft"]
+LaplacianSolver = Literal["cholespy", "pytorch"]
 
-def cotangent_weights(V, F):
+
+def cotangent_weights(
+    V: torch.Tensor, F: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute cotangent weights for mesh Laplacian.
 
@@ -97,7 +106,7 @@ def _weights_to_laplacian(W):
     return L.to_sparse_csr()
 
 
-def build_cotangent_laplacian(V, F):
+def build_cotangent_laplacian(V: torch.Tensor, F: torch.Tensor) -> torch.Tensor:
     """
     Build cotangent Laplacian matrix in sparse CSR format.
 
@@ -124,7 +133,12 @@ def build_cotangent_laplacian(V, F):
     return _weights_to_laplacian(W)
 
 
-def build_uniform_laplacian(F, n_verts, device=None, dtype=None):
+def build_uniform_laplacian(
+    F: torch.Tensor,
+    n_verts: int,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     """
     Build the uniform (graph) Laplacian: L = D - A, where A is the binary
     adjacency matrix and D is the diagonal degree matrix.
@@ -173,7 +187,7 @@ def build_uniform_laplacian(F, n_verts, device=None, dtype=None):
     return _weights_to_laplacian(A)
 
 
-def power_laplacian(L, order):
+def power_laplacian(L: torch.Tensor, order: int) -> torch.Tensor:
     """
     Compute L^order for higher-order Laplacian.
 
@@ -229,15 +243,15 @@ class LaplacianMesh(torch.nn.Module):
 
     def __init__(
         self,
-        V,
-        F,
-        mask_anchors,
-        order=1,
-        constraint_mode="hard",
-        soft_weight=1e-5,
-        jitter=0.0,
-        solver="cholespy",
-    ):
+        V: torch.Tensor,
+        F: torch.Tensor,
+        mask_anchors: torch.Tensor,
+        order: int = 1,
+        constraint_mode: LaplacianConstraintMode = "hard",
+        soft_weight: float = 1e-5,
+        jitter: float = 0.0,
+        solver: LaplacianSolver = "cholespy",
+    ) -> None:
         """
         Initialize Laplacian mesh editor.
 
@@ -482,7 +496,7 @@ class LaplacianMesh(torch.nn.Module):
         if self.solver_backend == "cholespy":
             self._chol_factor = _create_cholesky_factor(self.K)
 
-    def solve(self, Vdef):
+    def solve(self, Vdef: torch.Tensor) -> torch.Tensor:
         """
         Solve for deformed mesh given constraint vertices.
 

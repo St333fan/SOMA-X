@@ -11,10 +11,21 @@ Example:
     python convert_pca_to_npz.py ../assets/GarmentMeasurements/point.pca ../assets/GarmentMeasurements/point.npz
 """
 
+import argparse
+import logging
 import struct
 import sys
+from pathlib import Path
 
 import numpy as np
+
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from tools.logging_utils import add_logging_args, configure_logging  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def convert_pca_to_npz(input_file: str, output_file: str):
@@ -42,13 +53,20 @@ def convert_pca_to_npz(input_file: str, output_file: str):
         dimensions=np.array([m, n], dtype=np.int32),
     )
 
-    print(f"Converted {input_file} to {output_file}")
-    print(f"Dimensions: m={m}, n={n}")
+    logger.info(f"Converted {input_file} to {output_file}")
+    logger.info(f"Dimensions: m={m}, n={n}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input_file", help="Input GarmentMeasurements .pca file.")
+    parser.add_argument("output_file", help="Output .npz file.")
+    add_logging_args(parser)
+    args = parser.parse_args()
+    configure_logging(args)
+
+    convert_pca_to_npz(args.input_file, args.output_file)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print(__doc__)
-        sys.exit(1)
-
-    convert_pca_to_npz(sys.argv[1], sys.argv[2])
+    main()

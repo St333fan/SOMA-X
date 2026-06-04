@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -30,12 +31,19 @@ repo_root = Path(__file__).resolve().parents[1]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-from soma.geometry.rig_utils import remove_joint_orient_local  # noqa: E402
-from soma.geometry.transforms import matrix_to_rotvec  # noqa: E402
-from soma.io import add_npz_args, save_soma_npz  # noqa: E402
-from soma.pose_inversion import PoseInversion  # noqa: E402
+from soma.geometry.rig_utils import get_body_part_vertex_ids  # noqa: E402
+from soma.io import add_npz_args, export_soma_usd  # noqa: E402
+from soma.pose_inversion import (  # noqa: E402
+    PoseInversion,
+    _bind_joint_positions_from_cache,
+    _heel_vertex_ids,
+)
 from soma.soma import SOMALayer  # noqa: E402
 from soma.units import Unit  # noqa: E402
+from tools.conversion_utils import add_inversion_args, export_soma_npz  # noqa: E402
+from tools.logging_utils import add_logging_args, configure_logging  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def load_sam_parquet(path, max_samples=None):
@@ -77,7 +85,7 @@ def load_sam_parquet(path, max_samples=None):
     shape_params = np.stack(df["shape_params"].values).astype(np.float32)
     model_params = np.stack(df["model_params"].values).astype(np.float32)
 
-    print(f"Loaded {len(df)} MHR samples from {path}")
+    logger.info(f"Loaded {len(df)} MHR samples from {path}")
     return {
         "shape_params": shape_params,
         "model_params": model_params,
@@ -98,6 +106,176 @@ def parse_mhr_model_params(model_params):
     pose_params = model_params[:, 3:136]
     scale_params = model_params[:, 136:]
     return translation, pose_params, scale_params
+
+
+def _vertex_ids_for_roots(cache, root_names):
+    name_to_idx = {name: idx for idx, name in enumerate(cache["joint_names"])}
+    ids = []
+    for root_name in root_names:
+        root_idx = name_to_idx.get(root_name)
+        if root_idx is None:
+            continue
+        root_vids = get_body_part_vertex_ids(
+            cache["skinning_weights"],
+            cache["parent_ids"],
+            root_idx,
+            include_root=True,
+        )
+        ids.append(
+            torch.as_tensor(
+                root_vids,
+                dtype=torch.long,
+                device=cache["skinning_weights"].device,
+            )
+        )
+    if not ids:
+        return None
+    return torch.unique(torch.cat(ids))
+
+
+def compute_region_error_metrics(err, inv):
+    """Compute coarse body-region error summaries for fit diagnostics."""
+    cache = inv._cache
+    if cache is None:
+        return {}
+
+    feet = _vertex_ids_for_roots(cache, ["LeftFoot", "RightFoot"])
+    bind_shape = inv.soma._cached_rest_shape.detach()
+    bind_joint_positions = _bind_joint_positions_from_cache(
+        cache,
+        dtype=bind_shape.dtype,
+        device=bind_shape.device,
+    )
+    heel_vids = _heel_vertex_ids(
+        cache["joint_names"],
+        cache["parent_ids"],
+        cache["skinning_weights"],
+        bind_shape,
+        bind_joint_positions,
+    )
+    heels = (
+        torch.as_tensor(
+            heel_vids,
+            dtype=torch.long,
+            device=cache["skinning_weights"].device,
+        )
+        if heel_vids
+        else None
+    )
+    hands = _vertex_ids_for_roots(cache, ["LeftHand", "RightHand"])
+    head = _vertex_ids_for_roots(cache, ["Head"])
+
+    regions = {
+        "all": torch.arange(err.shape[1], device=err.device),
+        "heels": heels,
+        "feet": feet,
+        "hands": hands,
+        "head": head,
+    }
+
+    metrics = {}
+    for name, vids in regions.items():
+        if vids is None or len(vids) == 0:
+            continue
+        vals = err[:, vids.to(err.device)].reshape(-1)
+        metrics[name] = {
+            "n": len(vids),
+            "mean": float(vals.mean()),
+            "p95": float(torch.quantile(vals, 0.95)),
+            "max": float(vals.max()),
+        }
+    return metrics
+
+
+def print_region_error_summary(metrics, unit_label):
+    """Log contact-focused region errors for fit diagnostics."""
+    if "feet" in metrics and "hands" in metrics:
+        contact_mean = 0.5 * (metrics["feet"]["mean"] + metrics["hands"]["mean"])
+        logger.info(f"  Feet/hands equal-region mean: {contact_mean:.6f} {unit_label}")
+
+    logger.info("  Region vertex error:")
+    for name in ("heels", "feet", "hands", "head", "all"):
+        if name not in metrics:
+            continue
+        vals = metrics[name]
+        logger.info(
+            f"    {name:6s} n={vals['n']:5d} "
+            f"mean={vals['mean']:.6f} {unit_label}, "
+            f"p95={vals['p95']:.6f} {unit_label}, "
+            f"max={vals['max']:.6f} {unit_label}"
+        )
+
+
+def print_pose_drift_summary(local_rotation_drift, root_translation_drift, joint_names, unit_label):
+    """Log drift from the warm-start pose used by regularized refinement."""
+    if local_rotation_drift is None:
+        return
+
+    drift_deg = torch.rad2deg(local_rotation_drift)
+    if len(joint_names) + 1 == drift_deg.shape[1]:
+        drift_eval = drift_deg[:, 1:]
+        eval_names = joint_names
+    elif joint_names and joint_names[0] == "Root" and drift_deg.shape[1] > 1:
+        drift_eval = drift_deg[:, 1:]
+        eval_names = joint_names[1:]
+    else:
+        drift_eval = drift_deg
+        eval_names = joint_names
+
+    vals = drift_eval.reshape(-1)
+    logger.info("  Local-rotation drift from refinement warm start:")
+    logger.info(
+        f"    mean={vals.mean():.4f} deg, "
+        f"p95={torch.quantile(vals, 0.95):.4f} deg, "
+        f"max={vals.max():.4f} deg"
+    )
+
+    joint_means = drift_eval.mean(dim=0)
+    topk = min(5, joint_means.numel())
+    if topk:
+        top_vals, top_ids = torch.topk(joint_means, topk)
+        top_parts = [
+            f"{eval_names[int(idx)]}={float(val):.3f} deg"
+            for val, idx in zip(top_vals, top_ids, strict=True)
+        ]
+        logger.info(f"    largest mean joint drift: {', '.join(top_parts)}")
+
+    if root_translation_drift is not None:
+        logger.info(
+            f"    root translation drift mean={root_translation_drift.mean():.6f} {unit_label}, "
+            f"p95={torch.quantile(root_translation_drift, 0.95):.6f} {unit_label}, "
+            f"max={root_translation_drift.max():.6f} {unit_label}"
+        )
+
+
+def parse_pose_prior_weights(spec):
+    """Parse named autograd pose-prior profiles or comma-separated weights."""
+    if spec is None or spec == "uniform":
+        return None
+    if spec == "heel_contact":
+        weights = {}
+        for joint in ("Hips", "Spine1", "Spine2", "Chest"):
+            weights[joint] = 0.35
+        for side in ("Left", "Right"):
+            weights[f"{side}Leg"] = 0.35
+            weights[f"{side}Shin"] = 6.0
+            weights[f"{side}Foot"] = 8.0
+            weights[f"{side}ToeBase"] = 10.0
+            weights[f"{side}ToeEnd"] = 10.0
+        return weights
+
+    weights = {}
+    for part in spec.split(","):
+        if not part.strip():
+            continue
+        if "=" not in part:
+            raise ValueError(
+                "Expected --autograd-pose-prior-weights entries as "
+                "'JointName=value' or the named profile 'heel_contact'."
+            )
+        name, value = part.split("=", 1)
+        weights[name.strip()] = float(value)
+    return weights or None
 
 
 def get_mhr_posed_vertices(mhr_jit, identity_coeffs, model_params, device, batch_size=64):
@@ -134,9 +312,15 @@ def convert_mhr_to_soma(
     inv,
     body_iters=2,
     finger_iters=0,
-    full_iters=0,
+    full_iters=1,
+    lie_iters=3,
+    lie_lambda=1e-1,
     autograd_iters=0,
     autograd_lr=5e-3,
+    autograd_translation_lr_scale=1.0,
+    autograd_pose_prior=0.0,
+    autograd_pose_prior_weights=None,
+    autograd_leaf_weight=None,
     leaf_weight=1.0,
     batch_size=64,
 ):
@@ -149,10 +333,17 @@ def convert_mhr_to_soma(
         body_iters: analytical body chain iterations.
         finger_iters: analytical finger chain iterations.
         full_iters: analytical full chain iterations.
+        lie_iters: Lie algebra Gauss-Newton iterations (0 = disabled).
+        lie_lambda: Tikhonov regularisation for Lie-GN (default: 1e-1).
         autograd_iters: Adam optimization steps through FK + LBS.
         autograd_lr: learning rate for autograd Adam.
+        autograd_translation_lr_scale: root-translation learning-rate
+            multiplier for autograd Adam.
+        autograd_pose_prior: local-rotation prior weight for autograd FK.
+        autograd_pose_prior_weights: optional per-joint pose-prior multipliers.
+        autograd_leaf_weight: optional vertex weighting used only by autograd FK.
         leaf_weight: extremity vertex weight.  Float or dict, e.g.
-            ``{"head": 2, "hands": 2, "feet": 5}``.
+            ``{"head": 2, "hands": 2, "feet": 5, "heels": 10}``.
         batch_size: process in chunks.
 
     Returns:
@@ -164,8 +355,14 @@ def convert_mhr_to_soma(
         body_iters=body_iters,
         finger_iters=finger_iters,
         full_iters=full_iters,
+        lie_iters=lie_iters,
+        lie_lambda=lie_lambda,
         autograd_iters=autograd_iters,
         autograd_lr=autograd_lr,
+        autograd_translation_lr_scale=autograd_translation_lr_scale,
+        autograd_pose_prior=autograd_pose_prior,
+        autograd_pose_prior_weights=autograd_pose_prior_weights,
+        autograd_leaf_weight=autograd_leaf_weight,
         leaf_weight=leaf_weight,
         batch_size=batch_size,
     )
@@ -176,45 +373,22 @@ def main():
     parser.add_argument(
         "--input",
         required=True,
-        help="Path to SAM 3D Body .parquet file or directory of parquet files. Download them from https://huggingface.co/datasets/facebook/sam-3d-body-dataset",
+        help=(
+            "Path to SAM 3D Body .parquet file or directory of parquet files. "
+            "Download parquet data from "
+            "https://huggingface.co/datasets/facebook/sam-3d-body-dataset"
+        ),
     )
     parser.add_argument("--no-render", action="store_true", help="Skip video rendering.")
+    parser.add_argument("--output-usd", default=None, help="Output .usd/.usda/.usdc with UsdSkel.")
     add_npz_args(parser)
-    parser.add_argument(
-        "--data-root",
-        default=None,
-        help="Path to SOMA assets (default: <repo>/assets).",
-    )
     parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
         help="Maximum number of samples to process.",
     )
-    parser.add_argument(
-        "--body-iters", type=int, default=2, help="Analytical body iterations (default: 2)."
-    )
-    parser.add_argument(
-        "--finger-iters", type=int, default=0, help="Analytical finger iterations (default: 0)."
-    )
-    parser.add_argument(
-        "--full-iters", type=int, default=1, help="Analytical full iterations (default: 1)."
-    )
-    parser.add_argument(
-        "--autograd-iters",
-        type=int,
-        default=0,
-        help="Autograd FK optimization steps after analytical solve (default: 0 = analytical only).",
-    )
-    parser.add_argument(
-        "--autograd-lr", type=float, default=5e-3, help="Autograd learning rate (default: 5e-3)."
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=64,
-        help="Batch size for processing (default: 64).",
-    )
+    add_inversion_args(parser, autograd=True)
     parser.add_argument(
         "--leaf-weight",
         type=float,
@@ -222,14 +396,60 @@ def main():
         help="Uniform extremity vertex weight (default: 1.0 = no upweight).",
     )
     parser.add_argument(
+        "--hand-weight",
+        type=float,
+        default=None,
+        help="Override whole-hand vertex weight (default: same as --leaf-weight).",
+    )
+    parser.add_argument(
         "--foot-weight",
         type=float,
         default=None,
         help="Override foot vertex weight (default: same as --leaf-weight).",
     )
-    parser.add_argument("--device", default="cuda", help="Device (default: cuda).")
+    parser.add_argument(
+        "--heel-weight",
+        type=float,
+        default=None,
+        help="Override rear heel vertex weight without weighting the whole foot.",
+    )
+    parser.add_argument(
+        "--autograd-pose-prior",
+        type=float,
+        default=0.0,
+        help="Local-rotation prior weight for autograd FK refinement.",
+    )
+    parser.add_argument(
+        "--autograd-pose-prior-weights",
+        default=None,
+        help=(
+            "Optional autograd pose-prior joint weights. Use 'heel_contact' "
+            "or comma-separated JointName=value entries. Values >1 stiffen a "
+            "joint; values <1 let it move more."
+        ),
+    )
+    parser.add_argument(
+        "--autograd-hand-weight",
+        type=float,
+        default=None,
+        help="Whole-hand vertex weight used only by autograd FK.",
+    )
+    parser.add_argument(
+        "--autograd-foot-weight",
+        type=float,
+        default=None,
+        help="Foot vertex weight used only by autograd FK.",
+    )
+    parser.add_argument(
+        "--autograd-heel-weight",
+        type=float,
+        default=None,
+        help="Rear heel vertex weight used only by autograd FK.",
+    )
     parser.add_argument("--fps", type=int, default=4, help="Video frame rate (default: 4).")
+    add_logging_args(parser)
     args = parser.parse_args()
+    configure_logging(args)
 
     data_root = Path(args.data_root) if args.data_root else repo_root / "assets"
     device = args.device
@@ -240,14 +460,19 @@ def main():
     model_params_raw = sam_data["model_params"]
     N = shape_params.shape[0]
 
-    # Zero out MHR's 6 flexible bone-length parameters (last 6 of 133 pose params).
-    # These modify bone lengths and are not representable in the SOMA skeleton.
-    model_params_raw[:, 130:136] = 0.0
+    # Extract MHR's 6 flexible bone-length parameters (body indices 124-129,
+    # model_params indices 130-135). These modify skeleton proportions (spine,
+    # neck, shoulder, arm, hip, leg length) and are identity-like, but SAM 3D
+    # Body's fitter lets them vary per frame. We pass them through to SOMA's
+    # identity model via kwargs so the rest shape matches.
+    bone_length_flexibles = model_params_raw[:, 130:136].copy()
 
     translation_cm, pose_params, scale_params = parse_mhr_model_params(model_params_raw)
-    print(f"  Samples: {N}")
-    print(f"  Translation range (cm): [{translation_cm.min():.1f}, {translation_cm.max():.1f}]")
-    print(f"  Scale params range: [{scale_params.min():.3f}, {scale_params.max():.3f}]")
+    logger.info(f"  Samples: {N}")
+    logger.info(
+        f"  Translation range (cm): [{translation_cm.min():.1f}, {translation_cm.max():.1f}]"
+    )
+    logger.info(f"  Scale params range: [{scale_params.min():.3f}, {scale_params.max():.3f}]")
 
     # --- Set up MHR model ---
     import trimesh
@@ -263,7 +488,7 @@ def main():
     # --- Set up SOMA + PoseInversion ---
     # Use output_unit=CENTIMETERS so the internal rest shape matches MHR's
     # native unit — no ad-hoc unit conversion needed.
-    print("\nInitializing SOMA layer...")
+    logger.info("\nInitializing SOMA layer...")
     soma = SOMALayer(
         data_root,
         identity_model_type="mhr",
@@ -274,20 +499,38 @@ def main():
 
     all_ic = torch.from_numpy(shape_params).float().to(device)
     all_sp = torch.from_numpy(scale_params).float().to(device)
+    all_bl = torch.from_numpy(bone_length_flexibles).float().to(device)
 
     # Use low LOD for inversion (faster, negligible accuracy loss),
     # high LOD (soma) for rendering/evaluation.
     inv = PoseInversion(soma, low_lod=True)
 
-    # Build leaf_weight: uniform or per-group if --foot-weight is set
-    if args.foot_weight is not None:
+    # Build leaf_weight: uniform or per-group if an override is set.
+    if any(w is not None for w in (args.hand_weight, args.foot_weight, args.heel_weight)):
         leaf_weight = {
             "head": args.leaf_weight,
-            "hands": args.leaf_weight,
-            "feet": args.foot_weight,
+            "hands": args.leaf_weight if args.hand_weight is None else args.hand_weight,
+            "feet": args.leaf_weight if args.foot_weight is None else args.foot_weight,
         }
+        if args.heel_weight is not None:
+            leaf_weight["heels"] = args.heel_weight
     else:
         leaf_weight = args.leaf_weight
+
+    autograd_leaf_weight = None
+    if any(
+        w is not None
+        for w in (args.autograd_hand_weight, args.autograd_foot_weight, args.autograd_heel_weight)
+    ):
+        autograd_leaf_weight = {
+            "head": 1.0,
+            "hands": 1.0 if args.autograd_hand_weight is None else args.autograd_hand_weight,
+            "feet": 1.0 if args.autograd_foot_weight is None else args.autograd_foot_weight,
+        }
+        if args.autograd_heel_weight is not None:
+            autograd_leaf_weight["heels"] = args.autograd_heel_weight
+
+    autograd_pose_prior_weights = parse_pose_prior_weights(args.autograd_pose_prior_weights)
 
     # --- Fused MHR forward + inversion (chunked to bound memory) ---
     import time
@@ -297,26 +540,40 @@ def main():
         parts.append(
             f"analytical (body={args.body_iters}, finger={args.finger_iters}, full={args.full_iters})"
         )
+    if args.lie_iters > 0:
+        parts.append(f"lie-gn ({args.lie_iters} iters, lambda={args.lie_lambda})")
     if args.autograd_iters > 0:
-        parts.append(f"autograd FK ({args.autograd_iters} iters, lr={args.autograd_lr})")
+        parts.append(
+            f"autograd FK ({args.autograd_iters} iters, lr={args.autograd_lr}, "
+            f"translation_lr_scale={args.autograd_translation_lr_scale}, "
+            f"pose_prior={args.autograd_pose_prior})"
+        )
     method_desc = " + ".join(parts) if parts else "none"
     if leaf_weight != 1.0:
         method_desc += f", leaf_weight={leaf_weight}"
+    if autograd_leaf_weight is not None:
+        method_desc += f", autograd_leaf_weight={autograd_leaf_weight}"
+    if autograd_pose_prior_weights is not None:
+        method_desc += f", autograd_pose_prior_weights={autograd_pose_prior_weights}"
 
     batch_size = args.batch_size
-    print(f"\nInverting {N} samples with {method_desc}...")
-    torch.cuda.synchronize()
+    logger.info(f"\nInverting {N} samples with {method_desc}...")
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     all_rotations = []
     all_root_transl = []
     all_errors = []
+    all_rotation_drift = []
+    all_root_translation_drift = []
 
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
 
-        # Prepare identity for this chunk
-        inv.prepare_identity(all_ic[start:end], all_sp[start:end])
+        # Prepare identity for this chunk (includes per-frame bone-length flexibles)
+        chunk_kwargs = {"bone_length_flexibles": all_bl[start:end]}
+        inv.prepare_identity(all_ic[start:end], all_sp[start:end], kwargs=chunk_kwargs)
 
         # MHR forward pass for this chunk
         ic = identity_coeffs_t[start:end].to(device)
@@ -332,8 +589,14 @@ def main():
             body_iters=args.body_iters,
             finger_iters=args.finger_iters,
             full_iters=args.full_iters,
+            lie_iters=args.lie_iters,
+            lie_lambda=args.lie_lambda,
             autograd_iters=args.autograd_iters,
             autograd_lr=args.autograd_lr,
+            autograd_translation_lr_scale=args.autograd_translation_lr_scale,
+            autograd_pose_prior=args.autograd_pose_prior,
+            autograd_pose_prior_weights=autograd_pose_prior_weights,
+            autograd_leaf_weight=autograd_leaf_weight,
             leaf_weight=leaf_weight,
             batch_size=None,
         )
@@ -341,47 +604,84 @@ def main():
         all_rotations.append(result["rotations"].cpu())
         all_root_transl.append(result["root_translation"].cpu())
         all_errors.append(result["per_vertex_error"].cpu())
+        if "local_rotation_drift" in result:
+            all_rotation_drift.append(result["local_rotation_drift"].cpu())
+        if "root_translation_drift" in result:
+            all_root_translation_drift.append(result["root_translation_drift"].cpu())
 
-    torch.cuda.synchronize()
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize()
     dt = time.perf_counter() - t0
 
     rotations = torch.cat(all_rotations, dim=0)
     root_transl = torch.cat(all_root_transl, dim=0)
     err = torch.cat(all_errors, dim=0)
+    rotation_drift = torch.cat(all_rotation_drift, dim=0) if all_rotation_drift else None
+    root_translation_drift = (
+        torch.cat(all_root_translation_drift, dim=0) if all_root_translation_drift else None
+    )
 
     unit_label = "cm" if soma.output_unit == Unit.CENTIMETERS else "m"
-    print(f"  Inversion time: {dt:.2f}s ({N / dt:.0f} FPS)")
-    print(f"  Mean vertex error: {err.mean():.6f} {unit_label}")
-    print(f"  Max vertex error:  {err.max():.6f} {unit_label}")
-    print(f"  Median vertex error: {err.median():.6f} {unit_label}")
+    logger.info(f"  Inversion time: {dt:.2f}s ({N / dt:.0f} FPS)")
+    logger.info(f"  Mean vertex error: {err.mean():.6f} {unit_label}")
+    logger.info(f"  Max vertex error:  {err.max():.6f} {unit_label}")
+    logger.info(f"  Median vertex error: {err.median():.6f} {unit_label}")
+    region_metrics = compute_region_error_metrics(err, inv)
+    print_region_error_summary(region_metrics, unit_label)
+    print_pose_drift_summary(
+        rotation_drift,
+        root_translation_drift,
+        list(soma.rig_data["joint_names"]),
+        unit_label,
+    )
 
     # --- Save output ---
     if args.output_npz:
-        # Convert absolute → relative, matrix → rotvec
-        rel_rotations = remove_joint_orient_local(
-            rotations, soma._t_pose_orient, soma._t_pose_orient_parent_T
-        )
-        poses_rotvec = matrix_to_rotvec(rel_rotations.reshape(-1, 3, 3)).reshape(
-            rotations.shape[0], rotations.shape[1], 3
-        )
-
-        save_transl = root_transl.clone()
-        target_unit = Unit.from_name(args.output_unit)
-        unit_scale = soma.output_unit.meters_per_unit / target_unit.meters_per_unit
-        if unit_scale != 1.0:
-            save_transl = save_transl * unit_scale
-
-        save_soma_npz(
+        extra_arrays = {"bone_length_flexibles": bone_length_flexibles}
+        if rotation_drift is not None:
+            extra_arrays["local_rotation_drift_deg"] = torch.rad2deg(rotation_drift).numpy()
+        export_soma_npz(
             args.output_npz,
-            poses_rotvec,
-            save_transl,
-            joint_names=list(soma.rig_data["joint_names"]),
-            identity_model_type=soma.identity_model_type,
+            rotations,
+            root_transl,
+            soma,
+            output_unit=args.output_unit,
+            keep_root=args.keep_root,
             identity_coeffs=shape_params,
             scale_params=scale_params,
-            joint_orient=soma._t_pose_orient,
-            unit=args.output_unit,
-            keep_root=args.keep_root,
+            extra_arrays=extra_arrays,
+        )
+
+    if args.output_usd:
+        # USD uses a single bind pose, but SAM 3D Body has per-sample identity
+        # (shape + scale + bone-length params vary per frame). Warn if they differ.
+        ic_np = all_ic.cpu().numpy()
+        sp_np = all_sp.cpu().numpy()
+        bl_np = all_bl.cpu().numpy()
+        identity_varies = (
+            np.std(ic_np, axis=0).max() > 1e-4
+            or np.std(sp_np, axis=0).max() > 1e-4
+            or np.std(bl_np, axis=0).max() > 1e-4
+        )
+        if identity_varies:
+            import warnings
+
+            warnings.warn(
+                "Identity parameters vary across samples. USD export uses the "
+                "first sample's shape as a fixed bind pose; skinning will be "
+                "approximate for samples with different body shapes.",
+                stacklevel=1,
+            )
+
+        first_kwargs = {"bone_length_flexibles": all_bl[:1]}
+        soma.prepare_identity(all_ic[:1], all_sp[:1], kwargs=first_kwargs)
+        export_soma_usd(
+            args.output_usd,
+            soma,
+            rotations,
+            root_transl,
+            fps=float(args.fps),
+            unit="centimeters",
         )
 
     if args.no_render:
@@ -408,8 +708,9 @@ def main():
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
 
-        # Prepare identity for this chunk (high LOD)
-        soma.prepare_identity(all_ic[start:end], all_sp[start:end])
+        # Prepare identity for this chunk (high LOD, with bone-length flexibles)
+        chunk_kwargs = {"bone_length_flexibles": all_bl[start:end]}
+        soma.prepare_identity(all_ic[start:end], all_sp[start:end], kwargs=chunk_kwargs)
         chunk_bind = soma._cached_bind_transforms_world
         chunk_rest = soma._cached_rest_shape
         bs.rebind(chunk_bind, chunk_rest)
@@ -432,11 +733,16 @@ def main():
     mhr_verts_m = np.concatenate(mhr_verts_all, axis=0)
     eval_verts = np.concatenate(eval_verts_all, axis=0)
 
-    method_tag = "analytical"
+    parts_tag = []
+    if args.body_iters > 0 or args.finger_iters > 0 or args.full_iters > 0:
+        parts_tag.append("analytical")
+    if args.lie_iters > 0:
+        parts_tag.append(f"lie{args.lie_iters}")
     if args.autograd_iters > 0:
-        method_tag += f"_autograd{args.autograd_iters}"
+        parts_tag.append(f"autograd{args.autograd_iters}")
+    method_tag = "_".join(parts_tag) if parts_tag else "none"
     out_name = f"out/mhr2soma_eval_{method_tag}.mp4"
-    print(f"Rendering MHR (with correctives) vs SOMA (no correctives) -> {out_name}")
+    logger.info(f"Rendering MHR (with correctives) vs SOMA (no correctives) -> {out_name}")
     render_comparison_video(
         out_name,
         mhr_verts_m,

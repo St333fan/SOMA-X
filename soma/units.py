@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Length-unit helpers shared across SOMA-X APIs."""
+
 from enum import Enum
 
 
@@ -13,6 +15,7 @@ class Unit(Enum):
 
     @property
     def meters_per_unit(self) -> float:
+        """Return the number of meters represented by one unit."""
         return self.value
 
     @property

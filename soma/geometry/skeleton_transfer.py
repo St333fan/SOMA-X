@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Skeleton fitting utilities for adapting a bind rig to a new rest shape."""
+
+import logging
+from collections.abc import Sequence
+
 import torch
 
 from ._utils import one_hot_1d, require_torch_tensors
@@ -19,23 +24,28 @@ except ImportError:
     rodrigues_rotation_warp = None
     parallel_rodrigues_kabsch_warp = None
 
+logger = logging.getLogger(__name__)
+
 
 class SkeletonTransfer(torch.nn.Module):
+    """Fit joint positions and orientations to a new rest-shape surface."""
+
     def __init__(
         self,
-        joint_parent_ids,
-        bind_world_transforms,
-        bind_shape,
-        skinning_weights,
-        rbf_kernel="linear",
-        vertex_ids_to_exclude=None,
-        freeze_rotations=None,
-        skip_endjoints=True,
-        use_sparse_rbf_matrix=True,
-        use_warp_for_rotations=True,
-        rotation_method="kabsch",
-        skip_inverse_lbs=False,
-    ):
+        joint_parent_ids: Sequence[int],
+        bind_world_transforms: torch.Tensor,
+        bind_shape: torch.Tensor,
+        skinning_weights: torch.Tensor,
+        rbf_kernel: str = "linear",
+        vertex_ids_to_exclude: Sequence[int] | None = None,
+        freeze_rotations: Sequence[int] | None = None,
+        skip_endjoints: bool = True,
+        use_sparse_rbf_matrix: bool = True,
+        use_warp_for_rotations: bool = True,
+        rotation_method: str = "auto",
+        skip_inverse_lbs: bool = False,
+        root_joint_idx: int = 1,
+    ) -> None:
         """Initialize a SkeletonTransfer instance for fitting a skeleton to new shapes.
         Args:
             joint_parent_ids: (J,) int array of joint parent indices
@@ -48,8 +58,9 @@ class SkeletonTransfer(torch.nn.Module):
             skip_endjoints: bool, whether to skip rotation fitting for end joints (for Warp mode)
             use_sparse_rbf_matrix: bool, whether to use a sparse RBF matrix for joint position regression
             use_warp_for_rotations: bool, whether to use Warp-based rotation fitting (requires Warp)
-            rotation_method: str, rotation extraction method ('kabsch' or 'newton-schulz')
+            rotation_method: str, rotation extraction method ('auto', 'kabsch', or 'newton-schulz')
             skip_inverse_lbs: bool, whether to skip Inverse LBS (skinned vertex fitting) and use identity R_init
+            root_joint_idx: index of the root joint (0 for hand models, 1 for full-body SOMA)
         """
         super().__init__()
         if freeze_rotations is None:
@@ -92,6 +103,9 @@ class SkeletonTransfer(torch.nn.Module):
         self.use_sparse_rbf_matrix = use_sparse_rbf_matrix
         self.rotation_method = rotation_method
         self.skip_inverse_lbs = skip_inverse_lbs
+        self.root_joint_idx = root_joint_idx
+        # First joint to fit (skip virtual root at 0 for full-body)
+        self._first_joint = 0 if root_joint_idx == 0 else 1
         self._precompute_regressors()
 
         # Warp-specific precomputed data (initialized lazily)
@@ -133,7 +147,7 @@ class SkeletonTransfer(torch.nn.Module):
                 raise ImportError("Warp-based rotation fitting requires Warp to be installed.")
             self._precompute_warp_data()
 
-    def update_bind(self, bind_world_transforms, bind_shape):
+    def update_bind(self, bind_world_transforms: torch.Tensor, bind_shape: torch.Tensor) -> None:
         """Update bind-pose data without rebuilding structural caches.
 
         This is much faster than constructing a new SkeletonTransfer and is
@@ -145,9 +159,12 @@ class SkeletonTransfer(torch.nn.Module):
             bind_world_transforms, self.joint_parent_ids
         )
         self.bind_shape = bind_shape.detach()
+        self._precompute_regressors()
+        if self.use_warp_for_rotations:
+            self._precompute_warp_data()
 
     @property
-    def device(self):
+    def device(self) -> torch.device:
         return self.bind_world_transforms.device
 
     @property
@@ -182,7 +199,7 @@ class SkeletonTransfer(torch.nn.Module):
             joint_parent_ids_cur = joint_parent_ids_cur_update
 
         if torch.equal(zero_weight_ids, torch.tensor([0, 1], device=self.device)):
-            print("Aggregating children of hips")
+            logger.debug("Aggregating children of hips")
             child_ids = get_joint_children_ids(joint_parent_ids)[1]
             regressor_mask[:, 1] = regressor_mask[:, child_ids].any(axis=1)
 
@@ -201,7 +218,7 @@ class SkeletonTransfer(torch.nn.Module):
                 kernel=self.rbf_kernel,
                 include_polynomial=True,
             )
-            if i != 0
+            if i >= self._first_joint
             else None
             for i in range(self.num_joints)
         ]
@@ -253,7 +270,7 @@ class SkeletonTransfer(torch.nn.Module):
         stage1_joint_to_batch_idx = {}
 
         batch_idx = 0
-        for i in range(1, self.num_joints):
+        for i in range(self._first_joint, self.num_joints):
             if i in frozen:
                 continue
 
@@ -334,7 +351,7 @@ class SkeletonTransfer(torch.nn.Module):
         stage2_n2_joint_to_batch_idx = {}
 
         batch_idx_n2 = 0
-        for i in range(1, self.num_joints):
+        for i in range(self._first_joint, self.num_joints):
             children = self.joint_children_ids[i]
 
             if not children:
@@ -471,7 +488,7 @@ class SkeletonTransfer(torch.nn.Module):
             frozen_parents, dtype=torch.long, device=self.device
         )
 
-    def fit(self, target_shapes):
+    def fit(self, target_shapes: torch.Tensor) -> torch.Tensor:
         """Fit the skeleton to new shapes by adjusting joint positions and orientations.
         Args:
             target_shapes: (B, V, 3) or (V, 3) array of new vertex positions
@@ -492,7 +509,7 @@ class SkeletonTransfer(torch.nn.Module):
             )
         return world_bind_pose
 
-    def fit_joint_positions(self, target_shapes):
+    def fit_joint_positions(self, target_shapes: torch.Tensor) -> torch.Tensor:
         """Fit the skeleton to new shapes by adjusting joint positions.
         Args:
             target_shapes: (B, V, 3) or (V, 3) array of new vertex positions
@@ -514,10 +531,12 @@ class SkeletonTransfer(torch.nn.Module):
             new_joint_positions = new_joint_positions.reshape(J, B, 3).permute(1, 0, 2)
         else:
             cols = []
-            root_pos = self.bind_world_transforms[0, :3, 3].to(dtype=dtype, device=device)
-            root_pos = root_pos.view(1, 1, 3).expand(B, 1, 3)
-            cols.append(root_pos)
-            for i in range(1, J):
+            first = self._first_joint
+            # Virtual root joints (index < first) keep their bind position
+            for i in range(first):
+                root_pos = self.bind_world_transforms[i, :3, 3].to(dtype=dtype, device=device)
+                cols.append(root_pos.view(1, 1, 3).expand(B, 1, 3))
+            for i in range(first, J):
                 target_vertex_positions = target_shapes[:, self.regressor_mask[:, i]]
                 joint_query_position = self.bind_world_transforms[i : i + 1, :3, 3]
                 pred = self.joint_pos_regressors[i].interpolate(
@@ -529,7 +548,9 @@ class SkeletonTransfer(torch.nn.Module):
             new_joint_positions = torch.cat(cols, dim=1)
         return new_joint_positions[0] if added_batch else new_joint_positions
 
-    def fit_joint_rotations(self, new_joint_positions, target_shapes):
+    def fit_joint_rotations(
+        self, new_joint_positions: torch.Tensor, target_shapes: torch.Tensor
+    ) -> torch.Tensor:
         """Fit the skeleton to new positions by adjusting joint orientations.
         Args:
             new_joint_positions: (B, J, 3) or (J, 3) array of new joint positions
@@ -562,7 +583,7 @@ class SkeletonTransfer(torch.nn.Module):
         R0 = self.bind_world_transforms[..., :3, :3].clone()
         R = R0[None, ...].expand(B, J, 3, 3)
 
-        for i in range(1, J):
+        for i in range(self._first_joint, J):
             jmask = one_hot_1d(J, i, dtype=dtype, device=device)[None, :, None, None]
             children = self.joint_children_ids[i]
 
@@ -592,7 +613,7 @@ class SkeletonTransfer(torch.nn.Module):
                     self.bind_shape[skinned_vids] - self.bind_world_transforms[i, :3, 3]
                 )[None, :, :]
                 skinned_new = target_shapes[:, skinned_vids, :] - t[:, i : i + 1]
-                R_init = align_vectors(skinned_new, skinned_orig)
+                R_init = align_vectors(skinned_new, skinned_orig, method=self.rotation_method)
 
             if len(children) > 0:
                 pos_children_orig = (
@@ -604,7 +625,11 @@ class SkeletonTransfer(torch.nn.Module):
                 )
                 pos_children_new = t[:, children, :] - t[:, i : i + 1, :]
 
-                align_rot = align_vectors(pos_children_new, pos_children_orig)
+                align_rot = align_vectors(
+                    pos_children_new,
+                    pos_children_orig,
+                    method=self.rotation_method,
+                )
 
                 R_i_new = align_rot @ R_init_squeezed @ R[:, i, :, :]
             else:
@@ -615,7 +640,9 @@ class SkeletonTransfer(torch.nn.Module):
         world_bind_pose = SE3_from_Rt(R, t)
         return world_bind_pose[0] if added_batch else world_bind_pose
 
-    def fit_rotations_warp(self, new_joint_positions, target_shapes):
+    def fit_rotations_warp(
+        self, new_joint_positions: torch.Tensor, target_shapes: torch.Tensor
+    ) -> torch.Tensor:
         """Warp-accelerated version of fit_joint_rotations using GPU-parallel alignment.
 
         Args:

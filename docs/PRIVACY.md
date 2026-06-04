@@ -1,3 +1,5 @@
+# Privacy
+
 Field | Response
 :-----|:--------
 Generatable or reverse engineerable personal data? | No — SOMA generates anonymous 3D body meshes defined by continuous numerical shape coefficients. The canonical mesh topology is fixed and the released PCA shape space represents aggregate population-level statistics; it does not encode any specific individual's biometric identity and cannot be reverse-mapped to a participant. Shape coefficients do not correspond to real, identifiable individuals unless explicitly constructed to do so by the caller. The model does not process or output images, video, or biometric identifiers at inference time.
