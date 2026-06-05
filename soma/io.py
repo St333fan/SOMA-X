@@ -593,19 +593,7 @@ def _mesh_has_skinning(prim) -> bool:
     return bool(binding.GetJointIndicesPrimvar() and binding.GetJointWeightsPrimvar())
 
 
-def find_lod_skin_mesh_name(usd_path: str | Path, lod: str) -> str:
-    """Find the skinned mesh leaf name for a body LOD in a UsdSkel asset.
-
-    The nvHuman publishes use naming conventions such as ``c_skin_xlo`` or
-    ``c_bodyRig_xlo``.  This helper keeps the runtime tolerant to small naming
-    differences while still requiring a skinned mesh, not just any mesh whose
-    name contains the LOD token.
-    """
-    lod = lod.lower()
-    if lod not in _LOD_SKIN_MESH_CANDIDATES:
-        valid_lods = tuple(_LOD_SKIN_MESH_CANDIDATES)
-        raise ValueError(f"Unsupported LOD {lod!r}; expected one of {valid_lods}")
-
+def _open_usd_stage(usd_path: str | Path):
     usd_path_str = str(usd_path)
     if not Path(usd_path_str).exists():
         raise FileNotFoundError(f"USD file not found: {usd_path_str}")
@@ -613,6 +601,15 @@ def find_lod_skin_mesh_name(usd_path: str | Path, lod: str) -> str:
     stage = Usd.Stage.Open(usd_path_str)
     if not stage:
         raise RuntimeError(f"Failed to open USD file: {usd_path_str}")
+    return stage
+
+
+def _find_lod_skin_mesh_name_on_stage(stage, usd_path: str | Path, lod: str) -> str:
+    usd_path_str = str(usd_path)
+    lod = lod.lower()
+    if lod not in _LOD_SKIN_MESH_CANDIDATES:
+        valid_lods = tuple(_LOD_SKIN_MESH_CANDIDATES)
+        raise ValueError(f"Unsupported LOD {lod!r}; expected one of {valid_lods}")
 
     skin_meshes = [p for p in stage.Traverse() if p.IsA(UsdGeom.Mesh) and _mesh_has_skinning(p)]
     by_name = {p.GetPath().name: p for p in skin_meshes}
@@ -642,6 +639,18 @@ def find_lod_skin_mesh_name(usd_path: str | Path, lod: str) -> str:
     )
 
 
+def find_lod_skin_mesh_name(usd_path: str | Path, lod: str) -> str:
+    """Find the skinned mesh leaf name for a body LOD in a UsdSkel asset.
+
+    The nvHuman publishes use naming conventions such as ``c_skin_xlo`` or
+    ``c_bodyRig_xlo``.  This helper keeps the runtime tolerant to small naming
+    differences while still requiring a skinned mesh, not just any mesh whose
+    name contains the LOD token.
+    """
+    stage = _open_usd_stage(usd_path)
+    return _find_lod_skin_mesh_name_on_stage(stage, usd_path, lod)
+
+
 def load_lod_rig_from_usd(
     usd_path: str | Path,
     lod: str,
@@ -649,9 +658,35 @@ def load_lod_rig_from_usd(
     skin_mesh_name: str | None = None,
 ) -> RigUSDData:
     """Load rig data for a specific body LOD from a UsdSkel USD file."""
+    stage = _open_usd_stage(usd_path)
     if skin_mesh_name is None:
-        skin_mesh_name = find_lod_skin_mesh_name(usd_path, lod)
-    return load_rig_from_usd(usd_path, skin_mesh_name=skin_mesh_name)
+        skin_mesh_name = _find_lod_skin_mesh_name_on_stage(stage, usd_path, lod)
+    return _load_rig_from_usd_stage(stage, usd_path, skin_mesh_name=skin_mesh_name)
+
+
+def load_lod_rigs_from_usd(
+    usd_path: str | Path,
+    lods: Sequence[str],
+    *,
+    skin_mesh_names: Mapping[str, str] | None = None,
+) -> dict[str, RigUSDData]:
+    """Load multiple LOD rigs from one UsdSkel USD file with a shared stage."""
+    stage = _open_usd_stage(usd_path)
+    skin_mesh_names = skin_mesh_names or {}
+    rigs = {}
+    for lod in lods:
+        lod_key = lod.lower()
+        if lod_key in rigs:
+            continue
+        skin_mesh_name = skin_mesh_names.get(lod_key, skin_mesh_names.get(lod))
+        if skin_mesh_name is None:
+            skin_mesh_name = _find_lod_skin_mesh_name_on_stage(stage, usd_path, lod_key)
+        rigs[lod_key] = _load_rig_from_usd_stage(
+            stage,
+            usd_path,
+            skin_mesh_name=skin_mesh_name,
+        )
+    return rigs
 
 
 def load_rig_from_usd(usd_path: str | Path, *, skin_mesh_name: str | None = None) -> RigUSDData:
@@ -694,18 +729,23 @@ def load_rig_from_usd(usd_path: str | Path, *, skin_mesh_name: str | None = None
             *skin_mesh_name* (or the auto-discovery fallback), or has
             no points.
     """
+    stage = _open_usd_stage(usd_path)
+    return _load_rig_from_usd_stage(stage, usd_path, skin_mesh_name=skin_mesh_name)
+
+
+def _load_rig_from_usd_stage(
+    stage,
+    usd_path: str | Path,
+    *,
+    skin_mesh_name: str | None = None,
+) -> RigUSDData:
+    """Load SOMA template rig data from an already-open UsdSkel stage."""
     from pxr import UsdSkel
     from scipy.sparse import csc_matrix
 
     from .geometry.rig_utils import joint_local_to_world, joint_world_to_local
 
     usd_path_str = str(usd_path)
-    if not Path(usd_path_str).exists():
-        raise FileNotFoundError(f"USD file not found: {usd_path_str}")
-
-    stage = Usd.Stage.Open(usd_path_str)
-    if not stage:
-        raise RuntimeError(f"Failed to open USD file: {usd_path_str}")
 
     skel_prim = next((p for p in stage.Traverse() if p.IsA(UsdSkel.Skeleton)), None)
     if skel_prim is None:

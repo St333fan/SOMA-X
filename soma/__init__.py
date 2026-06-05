@@ -3,7 +3,7 @@
 
 """Public SOMA-X package exports."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from pathlib import Path
 
@@ -18,6 +18,7 @@ from .io import (
     find_lod_skin_mesh_name,
     list_usd_meshes,
     load_lod_rig_from_usd,
+    load_lod_rigs_from_usd,
     load_rig_from_usd,
     load_usd_animation,
     load_usd_mesh,
@@ -104,6 +105,7 @@ __all__ = [
     "find_lod_skin_mesh_name",
     "list_usd_meshes",
     "load_lod_rig_from_usd",
+    "load_lod_rigs_from_usd",
     "load_rig_from_usd",
     "load_usd_animation",
     "load_usd_mesh",

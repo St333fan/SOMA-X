@@ -63,7 +63,7 @@ class ShapeTransfer(nn.Module):
         self.soma_to_smpl = self.get_soma_to_smpl_interpolator()
 
         smpl_rest_mesh = trimesh.load(
-            self.data_root / "SMPL" / "smpl_base_body.obj", maintain_order=True, process=False
+            self.data_root / "SMPL" / "base_body.obj", maintain_order=True, process=False
         )
         smpl_rest_shape = torch.from_numpy(smpl_rest_mesh.vertices).float().to(device).unsqueeze(0)
         self.smpl_rest_shape_soma = self.smpl_soma.identity_model.identity_model_to_soma(
@@ -73,7 +73,7 @@ class ShapeTransfer(nn.Module):
 
     def get_soma_to_smpl_interpolator(self):
         mesh_smpl = trimesh.load(
-            self.data_root / "SMPL" / "smpl_base_body.obj", maintain_order=True, process=False
+            self.data_root / "SMPL" / "base_body.obj", maintain_order=True, process=False
         )
         V_smpl = torch.from_numpy(mesh_smpl.vertices).float().to(self.device)
         mesh_soma = trimesh.load(

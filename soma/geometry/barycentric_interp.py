@@ -25,7 +25,12 @@ import torch
 import trimesh
 
 
-def fabricate_tet(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+def fabricate_tet(
+    p0: np.ndarray,
+    p1: np.ndarray,
+    p2: np.ndarray,
+    normal_scale: str = "area",
+) -> np.ndarray:
     """
     Fabricate a tetrahedron from triangle vertices by adding a point
     perpendicular to the triangle plane.
@@ -34,13 +39,47 @@ def fabricate_tet(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
         p0: First triangle vertex, shape (..., 3)
         p1: Second triangle vertex, shape (..., 3)
         p2: Third triangle vertex, shape (..., 3)
+        normal_scale: ``"area"`` uses the legacy raw cross-product normal.
+            ``"edge"`` uses a unit normal scaled by local mean edge length.
 
     Returns:
         p3: Fourth point of tetrahedron, shape (..., 3)
     """
     n = np.cross(p1 - p0, p2 - p0, axis=-1)
+    if normal_scale == "edge":
+        edge_scale = (
+            np.linalg.norm(p1 - p0, axis=-1, keepdims=True)
+            + np.linalg.norm(p2 - p1, axis=-1, keepdims=True)
+            + np.linalg.norm(p0 - p2, axis=-1, keepdims=True)
+        ) / 3.0
+        n_norm = np.linalg.norm(n, axis=-1, keepdims=True)
+        scaled = n / np.maximum(n_norm, 1e-12) * edge_scale
+        n = np.where(n_norm > 1e-12, scaled, n)
+    elif normal_scale != "area":
+        raise ValueError(f"Unsupported normal_scale: {normal_scale}")
     p3 = p0 + n
     return p3
+
+
+def _fabricate_tet_torch(
+    p0: torch.Tensor,
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    normal_scale: str,
+) -> torch.Tensor:
+    n = torch.cross(p1 - p0, p2 - p0, dim=-1)
+    if normal_scale == "edge":
+        edge_scale = (
+            torch.linalg.norm(p1 - p0, dim=-1, keepdim=True)
+            + torch.linalg.norm(p2 - p1, dim=-1, keepdim=True)
+            + torch.linalg.norm(p0 - p2, dim=-1, keepdim=True)
+        ) / 3.0
+        n_norm = torch.linalg.norm(n, dim=-1, keepdim=True)
+        scaled = n / n_norm.clamp_min(1e-12) * edge_scale
+        n = torch.where(n_norm > 1e-12, scaled, n)
+    elif normal_scale != "area":
+        raise ValueError(f"Unsupported normal_scale: {normal_scale}")
+    return p0 + n
 
 
 def compute_barycentric_coords_3d(
@@ -126,6 +165,7 @@ class BarycentricInterpolator(torch.nn.Module):
         F_src: torch.Tensor,
         V_dst: torch.Tensor,
         correspondence_path: str | Path | None = None,
+        tet_normal_scale: str = "area",
     ) -> None:
         """
         Initialize barycentric interpolator.
@@ -135,15 +175,21 @@ class BarycentricInterpolator(torch.nn.Module):
             F_src: Source mesh faces, (n_faces, 3) - torch tensor
             V_dst: Target mesh vertices, (n_dst_verts, 3) - torch tensor
             correspondence_path: Optional path to load precomputed correspondence
+            tet_normal_scale: Height scale for fabricated tetrahedra. ``"area"``
+                preserves legacy behavior; ``"edge"`` uses a local edge-length
+                normal height.
         """
         super().__init__()
         if not all(isinstance(x, torch.Tensor) for x in (V_src, F_src, V_dst)):
             raise TypeError("V_src, F_src, and V_dst must be torch.Tensor.")
+        if tet_normal_scale not in {"area", "edge"}:
+            raise ValueError(f"Unsupported tet_normal_scale: {tet_normal_scale}")
 
         # Convert to numpy for trimesh operations
         self.V_src = V_src.detach().cpu().numpy()
         self.F_src = F_src.detach().cpu().numpy()
         self.V_dst = V_dst.detach().cpu().numpy()
+        self.tet_normal_scale = tet_normal_scale
         self.register_buffer(
             "V_src_torch", V_src.detach().to(dtype=torch.float32), persistent=False
         )
@@ -166,7 +212,7 @@ class BarycentricInterpolator(torch.nn.Module):
         mesh_src = trimesh.Trimesh(vertices=self.V_src, faces=self.F_src)
 
         # Find closest points on source mesh for each target vertex
-        closest_points, _, face_ids = mesh_src.nearest.on_surface(self.V_dst)
+        _, _, face_ids = mesh_src.nearest.on_surface(self.V_dst)
         face_ids = face_ids.astype(np.int64)
 
         # Fabricate tetrahedra from triangles
@@ -174,6 +220,7 @@ class BarycentricInterpolator(torch.nn.Module):
             self.V_src[self.F_src[:, 0]],
             self.V_src[self.F_src[:, 1]],
             self.V_src[self.F_src[:, 2]],
+            normal_scale=self.tet_normal_scale,
         )
 
         # Concatenate original vertices with fabricated points
@@ -251,7 +298,12 @@ class BarycentricInterpolator(torch.nn.Module):
         f1 = V_src_deformed[:, face_indices[:, 1], :]
         f2 = V_src_deformed[:, face_indices[:, 2], :]
 
-        V_src_P3 = f0 + torch.cross(f1 - f0, f2 - f0, dim=-1)  # (batch, n_faces, 3)
+        V_src_P3 = _fabricate_tet_torch(
+            f0,
+            f1,
+            f2,
+            self.tet_normal_scale,
+        )  # (batch, n_faces, 3)
 
         # Concatenate: (batch, n_src_verts + n_faces, 3)
         V_src_tet = torch.cat([V_src_deformed, V_src_P3], dim=1)

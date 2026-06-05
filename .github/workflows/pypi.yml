@@ -12,6 +12,11 @@ on:
     tags:
       - 'v[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to publish a GitHub Release for."
+        required: false
+        type: string
 
 jobs:
   build:
@@ -24,6 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,6 +42,8 @@ jobs:
           expected=""
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             expected="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            expected="${{ inputs.tag }}"
           fi
           if [[ -n "$expected" ]]; then
             package_version="$(python tools/ci/check_release_version.py --expected "$expected")"
@@ -121,3 +129,68 @@ jobs:
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-github-release:
+    name: Publish GitHub Release
+    needs:
+      - build
+      - publish-pypi
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v') &&
+          needs.publish-pypi.result == 'success'
+        ) ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          inputs.tag != ''
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: py-soma-x-*-dists
+          path: dist
+          merge-multiple: true
+
+      - name: Extract release notes
+        run: |
+          python tools/ci/extract_release_notes.py \
+            --tag "$RELEASE_TAG" \
+            --output release-notes.md
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="${RELEASE_TAG}"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --notes-file release-notes.md
+            gh release upload "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi

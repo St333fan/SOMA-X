@@ -1,5 +1,7 @@
 import logging
 import os
+import warnings
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -11,6 +13,72 @@ from .units import Unit
 logger = logging.getLogger(__name__)
 
 ArrayLike = np.ndarray | torch.Tensor
+_DEFAULT_CORRECTIVES_MODEL_FILENAME = "correctives_model.pt"
+
+
+class _DefaultCorrectivesModelPath:
+    def __repr__(self) -> str:
+        return "_DEFAULT_CORRECTIVES_MODEL_PATH"
+
+
+_DEFAULT_CORRECTIVES_MODEL_PATH = _DefaultCorrectivesModelPath()
+
+
+def _resolve_correctives_model_path(
+    *,
+    data_root: str | Path,
+    correctives_model_path: str | Path | None,
+    load_correctives_model: bool | None,
+    default_enabled: bool = True,
+) -> Path | None:
+    """Resolve the corrective checkpoint path while preserving the legacy flag."""
+    path_is_default = correctives_model_path is _DEFAULT_CORRECTIVES_MODEL_PATH
+    path_is_disabled = correctives_model_path is None
+    path_is_explicit = not path_is_default and not path_is_disabled
+
+    if load_correctives_model is not None:
+        warnings.warn(
+            "load_correctives_model is deprecated; use correctives_model_path=None "
+            "to disable corrective loading, or pass a checkpoint path.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        if path_is_explicit:
+            raise ValueError(
+                "Do not pass load_correctives_model together with an explicit "
+                "correctives_model_path."
+            )
+        if load_correctives_model:
+            if path_is_disabled:
+                raise ValueError(
+                    "load_correctives_model=True conflicts with correctives_model_path=None."
+                )
+            if not default_enabled:
+                raise ValueError(
+                    "Correctives require procedural transforms; construct with "
+                    "enable_procedural_transforms=True or disable correctives."
+                )
+            return Path(data_root) / _DEFAULT_CORRECTIVES_MODEL_FILENAME
+        return None
+
+    if path_is_disabled:
+        return None
+
+    if path_is_default:
+        if not default_enabled:
+            return None
+        return Path(data_root) / _DEFAULT_CORRECTIVES_MODEL_FILENAME
+
+    if not default_enabled:
+        raise ValueError(
+            "Correctives require procedural transforms; construct with "
+            "enable_procedural_transforms=True or disable correctives."
+        )
+
+    path = Path(correctives_model_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Correctives model checkpoint not found: {path}")
+    return path
 
 
 def _as_float_tensor(x: ArrayLike) -> torch.Tensor:

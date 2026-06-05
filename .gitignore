@@ -138,10 +138,10 @@ dmypy.json
 
 # Project specific
 out/
-assets/SMPL/SMPL_NEUTRAL.pkl
+assets/*.pkl
+assets/**/*.pkl
 assets/nova-in-action.mp4
 assets/SMPLX/SMPLX_NEUTRAL.npz
-assets/SMPLX/SMPLX_NEUTRAL.pkl
 assets/GarmentMeasurements/point.npz
 
 public/

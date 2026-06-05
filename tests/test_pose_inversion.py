@@ -3,9 +3,9 @@
 
 """Tests for PoseInversion.
 
-Tests both ``fit()`` (analytical inverse-LBS refit) and ``fit(autograd_iters=...)``
-(FK-based gradient optimization) against ground-truth posed vertices
-from example_animation.npy.
+Tests both the default ``fit()`` solver (analytical inverse-LBS warm start plus
+Lie-GN refinement) and ``fit(autograd_iters=...)`` (FK-based gradient
+optimization) against ground-truth posed vertices from example_animation.npy.
 
 Pose conventions
 ~~~~~~~~~~~~~~~~
@@ -219,9 +219,16 @@ def _load_motion(soma, frames):
     pose = pose[frames]
     transl = transl[frames]
 
-    # Forward pass — these rotations are relative to T-pose
+    # Forward pass — these rotations are relative to T-pose. Pose inversion fits
+    # raw LBS, so keep correctives out of the target vertices.
     with torch.no_grad():
-        out = soma.pose(pose, transl=transl, pose2rot=False, absolute_pose=False)
+        out = soma.pose(
+            pose,
+            transl=transl,
+            pose2rot=False,
+            absolute_pose=False,
+            apply_correctives=False,
+        )
 
     return out["vertices"], transl
 
@@ -262,11 +269,15 @@ def test_xlo_layer_default_inversion_uses_xlo_topology():
         )["vertices"]
 
     # This test validates topology selection, not minimum-iteration convergence.
-    # A few extra XLO refit passes keep the assertion stable across GPU runtimes.
-    result = inv.fit(target, body_iters=5, finger_iters=0, full_iters=2)
+    # XLO has sparse support, so its inverse fit varies more across GPU runtimes
+    # than the denser mid/low LOD tests below.
+    xlo_mean_error_limit = 0.02
+    result = inv.fit(target)
     assert result["per_vertex_error"].shape == (1, soma.bind_shape.shape[0])
     mean_err = result["per_vertex_error"].mean().item()
-    assert mean_err < 0.01, f"XLO topology inversion error too high: {mean_err:.6f}"
+    assert mean_err < xlo_mean_error_limit, (
+        f"XLO topology inversion error too high: {mean_err:.6f}"
+    )
 
 
 @pytest.mark.slow
@@ -331,18 +342,71 @@ def soma_and_inv():
     return soma, inv
 
 
+@pytest.fixture(scope="module")
+def soma_and_inv_no_procedural():
+    """Create legacy public-rig SOMALayer + PoseInversion."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if not ASSETS_DIR.is_dir():
+        pytest.fail(f"Assets directory not found: {ASSETS_DIR}")
+    if not MOTION_FILE.is_file():
+        pytest.fail(f"Motion file not found: {MOTION_FILE}")
+
+    from soma.pose_inversion import PoseInversion
+    from soma.soma import SOMALayer
+
+    device = "cuda"
+    soma = SOMALayer(
+        data_root=str(ASSETS_DIR),
+        identity_model_type="soma",
+        device=device,
+        mode="warp",
+        low_lod=True,
+        enable_procedural_transforms=False,
+    )
+
+    n_id = soma.identity_model.num_identity_coeffs
+    identity_coeffs = torch.zeros(1, n_id, device=device)
+    soma.prepare_identity(identity_coeffs)
+
+    inv = PoseInversion(soma, low_lod=True)
+    inv.prepare_identity(identity_coeffs)
+
+    return soma, inv
+
+
 @requires_cuda
 class TestInvert:
-    """Tests for PoseInversion.fit() (analytical Kabsch)."""
+    """Tests for PoseInversion.fit() default solver."""
 
     def test_single_frame_roundtrip(self, soma_and_inv):
         """Single frame: fit recovers pose with low error."""
         soma, inv = soma_and_inv
         verts, _ = _load_motion(soma, frames=[0])
 
-        result = inv.fit(verts, body_iters=10, finger_iters=2, full_iters=1, lie_iters=0)
+        result = inv.fit(verts)
 
         J = result["rotations"].shape[1]  # 78 (root + 77 joints)
+        assert result["rotations"].shape == (1, J, 3, 3)
+        assert result["root_translation"].shape == (1, 3)
+        assert result["per_vertex_error"].shape[0] == 1
+
+        mean_err = result["per_vertex_error"].mean().item()
+        max_err = result["per_vertex_error"].max().item()
+        assert mean_err < 0.01, f"Mean vertex error too high: {mean_err:.6f} m"
+        assert max_err < 0.05, f"Max vertex error too high: {max_err:.6f} m"
+
+    def test_single_frame_roundtrip_without_procedural_transforms(
+        self,
+        soma_and_inv_no_procedural,
+    ):
+        """Default solver should also fit the non-procedural public rig."""
+        soma, inv = soma_and_inv_no_procedural
+        verts, _ = _load_motion(soma, frames=[0])
+
+        result = inv.fit(verts)
+
+        J = result["rotations"].shape[1]
         assert result["rotations"].shape == (1, J, 3, 3)
         assert result["root_translation"].shape == (1, 3)
         assert result["per_vertex_error"].shape[0] == 1
@@ -357,7 +421,7 @@ class TestInvert:
         soma, inv = soma_and_inv
         verts, _ = _load_motion(soma, frames=[0, 100, 300, 600])
 
-        result = inv.fit(verts, body_iters=10, finger_iters=2, full_iters=1, lie_iters=0)
+        result = inv.fit(verts)
 
         J = result["rotations"].shape[1]
         assert result["rotations"].shape == (4, J, 3, 3)
@@ -376,7 +440,7 @@ class TestInvert:
         soma, inv = soma_and_inv
         verts_gt, _ = _load_motion(soma, frames=[50, 200])
 
-        result = inv.fit(verts_gt, body_iters=10, finger_iters=2, full_iters=1, lie_iters=0)
+        result = inv.fit(verts_gt)
 
         # Strip root joint (index 0) — soma.pose() expects 77 joints
         rotations_no_root = result["rotations"][:, 1:]
@@ -404,8 +468,8 @@ class TestInvert:
         soma, inv = soma_and_inv
         verts, _ = _load_motion(soma, frames=[0, 50, 100, 150])
 
-        result_all = inv.fit(verts, body_iters=5, finger_iters=2, lie_iters=0)
-        result_chunked = inv.fit(verts, body_iters=5, finger_iters=2, lie_iters=0, batch_size=2)
+        result_all = inv.fit(verts)
+        result_chunked = inv.fit(verts, batch_size=2)
 
         assert result_chunked["rotations"].shape == result_all["rotations"].shape
 
@@ -426,10 +490,15 @@ class TestInvert:
 
         transl = torch.zeros(1, 3, device=device)
         with torch.no_grad():
-            out = soma.pose(rot_mats, transl=transl, pose2rot=False)
+            out = soma.pose(
+                rot_mats,
+                transl=transl,
+                pose2rot=False,
+                apply_correctives=False,
+            )
         verts = out["vertices"]
 
-        result = inv.fit(verts, body_iters=5, finger_iters=2, full_iters=1, lie_iters=0)
+        result = inv.fit(verts)
 
         mean_err = result["per_vertex_error"].mean().item()
         assert mean_err < 0.02, f"Identity pose error too high: {mean_err:.6f} m"

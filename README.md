@@ -2,10 +2,11 @@
   <img src="./assets/images/banner.png" alt="Banner" width="100%">
 </p>
 
+[![PyPI version](https://badge.fury.io/py/py-soma-x.svg)](https://badge.fury.io/py/py-soma-x)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Technical Report](https://img.shields.io/badge/arXiv-2603.16858-b31b1b.svg)](https://arxiv.org/abs/2603.16858)
 
-Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
+**[Documentation](https://nvlabs.github.io/SOMA-X/stable/)** | [PyPI](https://pypi.org/project/py-soma-x/) | [Changelog](CHANGELOG.md)
 
 ## Overview
 
@@ -51,6 +52,8 @@ SOMA is part of a larger effort to enable human animation, robotics, physical AI
 ## Installation
 
 ### Install from PyPI
+
+The easiest way to install SOMA-X is from [PyPI](https://pypi.org/project/py-soma-x/):
 
 ```bash
 pip install py-soma-x

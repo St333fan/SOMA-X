@@ -410,7 +410,11 @@ def main():
                 else:
                     coeffs_single = coeffs[:1]
                     scale_single = scale[:1] if scale is not None else None
-                model.prepare_identity(coeffs_single, scale_single)
+                model.prepare_identity(
+                    coeffs_single,
+                    scale_single,
+                    repose_to_bind_pose=args.apply_correctives,
+                )
 
         for start in range(0, T, pose_batch_size):
             end = min(start + pose_batch_size, T)
@@ -426,7 +430,11 @@ def main():
                     else:
                         coeffs_b = coeffs[start:end]
                         scale_b = scale[start:end] if scale is not None else None
-                    model.prepare_identity(coeffs_b, scale_b)
+                    model.prepare_identity(
+                        coeffs_b,
+                        scale_b,
+                        repose_to_bind_pose=args.apply_correctives,
+                    )
 
                 out_b = model.pose(
                     pose_b,

@@ -13,7 +13,7 @@ from scipy.sparse import csc_matrix
 
 from soma.geometry.lbs import batch_rodrigues
 from soma.geometry.rig_utils import joint_world_to_local
-from soma.io import load_lod_rig_from_usd
+from soma.io import load_lod_rig_from_usd, load_lod_rigs_from_usd
 from soma.procedural_transforms import (
     SOMA_ALIGNED_X_SWING_TWIST_MODE,
     SOMA_LOCAL_X_EULER_TWIST_MODE,
@@ -301,18 +301,39 @@ def _make_synthetic_twist_layer(
 ):
     import soma.soma as soma_module
     from soma import SOMALayer
+    from soma.io import load_lod_rig_from_usd as original_load_lod_rig_from_usd
 
-    original_load = soma_module.load_lod_rig_from_usd
+    original_load_many = soma_module.load_lod_rigs_from_usd
     public_joint_names = _public_joint_names()
 
     def fake_load_lod_rig_from_usd(path, rig_lod, skin_mesh_name=None):
         if Path(path) == TEMPLATE_RIG:
-            universal = original_load(TEMPLATE_RIG, rig_lod, skin_mesh_name=skin_mesh_name)
+            universal = original_load_lod_rig_from_usd(
+                TEMPLATE_RIG,
+                rig_lod,
+                skin_mesh_name=skin_mesh_name,
+            )
             base = derive_soma_rig_without_procedural_joints(universal, public_joint_names)
             return _synthetic_twist_rig(base)
-        return original_load(path, rig_lod, skin_mesh_name=skin_mesh_name)
+        return original_load_lod_rig_from_usd(path, rig_lod, skin_mesh_name=skin_mesh_name)
 
-    monkeypatch.setattr(soma_module, "load_lod_rig_from_usd", fake_load_lod_rig_from_usd)
+    def fake_load_lod_rigs_from_usd(path, lods, skin_mesh_names=None):
+        if Path(path) != TEMPLATE_RIG:
+            return original_load_many(path, lods, skin_mesh_names=skin_mesh_names)
+        skin_mesh_names = skin_mesh_names or {}
+        return {
+            rig_lod.lower(): fake_load_lod_rig_from_usd(
+                path,
+                rig_lod,
+                skin_mesh_name=skin_mesh_names.get(
+                    rig_lod.lower(),
+                    skin_mesh_names.get(rig_lod),
+                ),
+            )
+            for rig_lod in lods
+        }
+
+    monkeypatch.setattr(soma_module, "load_lod_rigs_from_usd", fake_load_lod_rigs_from_usd)
     return SOMALayer(
         data_root=ASSETS_DIR,
         lod=lod,
@@ -369,8 +390,10 @@ def test_packaged_definition_is_unsuffixed_and_declares_twist_segments():
 @pytest.mark.cpu
 @pytest.mark.asset_heavy
 def test_packaged_template_rig_lods_preserve_procedural_contract():
+    rigs = load_lod_rigs_from_usd(TEMPLATE_RIG, ("mid", "low", "xlo"))
+
     for lod, vertex_count in (("mid", 18056), ("low", 4505), ("xlo", 612)):
-        rig = load_lod_rig_from_usd(TEMPLATE_RIG, lod)
+        rig = rigs[lod]
         derived = derive_soma_rig_without_procedural_joints(
             rig,
             _public_joint_names(),
@@ -861,14 +884,14 @@ def test_twist_mode_rejects_non_twist_rig_asset(monkeypatch, tmp_path):
 
     no_twist_path = tmp_path / "no_twist.usda"
     no_twist_path.write_text("#usda 1.0\n")
-    original_load = soma_module.load_lod_rig_from_usd
+    original_load_many = soma_module.load_lod_rigs_from_usd
 
-    def fake_load_lod_rig_from_usd(path, rig_lod, skin_mesh_name=None):
+    def fake_load_lod_rigs_from_usd(path, lods, skin_mesh_names=None):
         if Path(path) == no_twist_path:
-            return _public_mid_rig()
-        return original_load(path, rig_lod, skin_mesh_name=skin_mesh_name)
+            return {rig_lod.lower(): _public_mid_rig() for rig_lod in lods}
+        return original_load_many(path, lods, skin_mesh_names=skin_mesh_names)
 
-    monkeypatch.setattr(soma_module, "load_lod_rig_from_usd", fake_load_lod_rig_from_usd)
+    monkeypatch.setattr(soma_module, "load_lod_rigs_from_usd", fake_load_lod_rigs_from_usd)
     with pytest.raises(ValueError, match="require a SOMA template rig with twist joints"):
         SOMALayer(
             data_root=ASSETS_DIR,
@@ -974,6 +997,43 @@ def test_twist_layer_public_transforms_match_public_layer_after_identity_fit():
 
     torch.testing.assert_close(twist_out["transforms"], public_out["transforms"])
     torch.testing.assert_close(twist_out["joints"], public_out["joints"])
+
+
+@pytest.mark.slow
+@pytest.mark.cpu
+@pytest.mark.asset_heavy
+def test_twist_layer_reposed_bind_pose_matches_public_layer_neutral_output():
+    from soma import SOMALayer
+
+    public_layer = SOMALayer(
+        data_root=ASSETS_DIR,
+        lod="low",
+        device="cpu",
+        identity_model_type="soma",
+        mode="dense",
+        enable_procedural_transforms=False,
+        correctives_model_path=None,
+    )
+    twist_layer = SOMALayer(
+        data_root=ASSETS_DIR,
+        lod="low",
+        device="cpu",
+        identity_model_type="soma",
+        mode="dense",
+        enable_procedural_transforms=True,
+        correctives_model_path=None,
+    )
+    identity = torch.zeros(1, public_layer.identity_model.num_identity_coeffs)
+    poses = torch.zeros(1, 77, 3)
+
+    public_layer.prepare_identity(identity, repose_to_bind_pose=True)
+    twist_layer.prepare_identity(identity, repose_to_bind_pose=True)
+    public_out = public_layer.pose(poses, apply_correctives=False)
+    twist_out = twist_layer.pose(poses, apply_correctives=False)
+
+    torch.testing.assert_close(twist_out["transforms"], public_out["transforms"])
+    torch.testing.assert_close(twist_out["joints"], public_out["joints"])
+    torch.testing.assert_close(twist_out["vertices"], public_out["vertices"], atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.slow
@@ -1097,7 +1157,7 @@ def test_twist_layer_preserves_public_joints_and_fk_full_consistency(
     assert full["joints"].shape == (1, 77, 3)
     assert full["transforms"].shape == (1, len(layer._public_joint_names), 4, 4)
     assert len(layer.rig_data["joint_names"]) > len(layer._public_joint_names)
-    assert not hasattr(layer, "public_batched_skinning")
+    assert layer.public_batched_skinning is not None
     assert layer.public_joint_parent_ids.shape == (len(layer._public_joint_names),)
     assert "vertices" not in fk_only
     torch.testing.assert_close(fk_only["transforms"], full["transforms"])

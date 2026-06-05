@@ -24,7 +24,9 @@ workflow.
 ## Release steps
 
 1. Merge the public-release prep MRs into internal `main`.
-2. Cut the internal release branch, for example `release-0.2`.
+2. Cut or refresh the minor-line internal release branch, for example
+   `release-0.2`. Patch releases reuse the same minor-line branch and create a
+   new patch tag, for example `v0.2.1` from `release-0.2`.
 3. Confirm `setup.cfg` and `soma/__init__.py` both contain the intended package
    version, for example `0.2.0`.
 4. Mirror the public-safe release branch to public GitHub.
@@ -34,8 +36,8 @@ workflow.
 7. Create the release tag from the public-safe release branch:
 
    ```bash
-   git tag -a v0.2.0 -m "SOMA-X 0.2.0"
-   git push origin v0.2.0
+   git tag -a vX.Y.Z -m "SOMA-X X.Y.Z"
+   git push origin vX.Y.Z
    ```
 
 8. Verify the tag-triggered workflow publishes to TestPyPI first.
@@ -49,7 +51,7 @@ workflow.
 Run these from the release branch before tagging:
 
 ```bash
-python tools/ci/check_release_version.py --expected v0.2.0
+python tools/ci/check_release_version.py --expected vX.Y.Z
 python -m build --sdist --wheel
 python -m twine check --strict dist/*
 ```

@@ -125,7 +125,7 @@ arm local-X twist to axis X, left leg local-X twist to negative axis Y, and
 right leg local-X twist to positive axis Y. The JSON translation matrix places
 twist helpers along the fitted public segment, preserving identity and
 body-part stretch instead of trusting independently fitted twist translations.
-Pose correctives are rejected in twist mode for this round.
+Pose correctives are supported only in this procedural-transform mode.
 
 Pose tensor (``poses``)
 -----------------------
@@ -213,8 +213,10 @@ Correctives
 -----------
 
 Pose-dependent corrective vertex offsets are applied by default
-(``apply_correctives=True`` on ``pose()`` / ``forward()``). Pass ``False``
-for a pure LBS output.
+(``apply_correctives=True`` on ``pose()`` / ``forward()``) when a corrective
+checkpoint is loaded. Body correctives require procedural transforms. Pass
+``apply_correctives=False`` for a pure LBS output, or construct with
+``correctives_model_path=None`` to skip loading the checkpoint entirely.
 
 Units
 -----
@@ -239,7 +241,11 @@ import torch.nn as nn
 from scipy.sparse import csc_matrix
 from scipy.spatial import cKDTree
 
-from .correctives_model import CorrectivesMLP
+from .correctives_model import (
+    _DEFAULT_CORRECTIVES_MODEL_PATH,
+    CorrectivesMLP,
+    _resolve_correctives_model_path,
+)
 from .geometry._warp_init import ensure_warp_initialized
 from .geometry.barycentric_interp import BarycentricInterpolator
 from .geometry.batched_skinning import BatchedSkinning, FKTopology
@@ -255,7 +261,7 @@ from .io import (
     SOMA_TEMPLATE_RIG_FILENAME,
     SOMA_XLO_TEMPLATE_RIG_FILENAME,
     fan_triangulate,
-    load_lod_rig_from_usd,
+    load_lod_rigs_from_usd,
     missing_soma_neutral_rig_keys,
 )
 from .procedural_transforms import (
@@ -450,7 +456,8 @@ class SOMALayer(nn.Module):
         lod: str | None = None,
         template_rig_path: str | Path | None = None,
         enable_procedural_transforms: bool = True,
-        load_correctives_model: bool = True,
+        load_correctives_model: bool | None = None,
+        correctives_model_path: str | Path | None = _DEFAULT_CORRECTIVES_MODEL_PATH,
     ) -> None:
         """Build a SOMALayer with the selected identity backend.
 
@@ -491,9 +498,11 @@ class SOMALayer(nn.Module):
                 v0026 twist-joint rig and drive SOMA-owned twist joints from the
                 JSON procedural definition. ``False`` opts out to the legacy
                 78-joint public rig.
-            load_correctives_model: If ``False``, skip loading the pose-corrective
-                checkpoint. Use this for pure LBS/profile paths that always pass
-                ``apply_correctives=False``.
+            load_correctives_model: Deprecated compatibility alias. Use
+                ``correctives_model_path=None`` instead of ``False``.
+            correctives_model_path: Path to a pose-corrective checkpoint. Defaults
+                to ``data_root/correctives_model.pt`` when procedural transforms
+                are enabled. Pass ``None`` to skip loading correctives.
         """
         super().__init__()
 
@@ -513,6 +522,12 @@ class SOMALayer(nn.Module):
             data_root = get_assets_dir()
 
         data_root = Path(data_root)
+        self.correctives_model_path = _resolve_correctives_model_path(
+            data_root=data_root,
+            correctives_model_path=correctives_model_path,
+            load_correctives_model=load_correctives_model,
+            default_enabled=enable_procedural_transforms,
+        )
 
         # Check for core asset file
         core_asset = data_root / "SOMA_neutral.npz"
@@ -574,9 +589,12 @@ class SOMALayer(nn.Module):
             core_asset=core_asset,
             definition_path=definition_path,
         )
+        template_lod_rigs = {}
         if template_rig_path.exists():
             self.procedural_template_rig_path = template_rig_path
-            template_mid_rig_data = load_lod_rig_from_usd(template_rig_path, "mid")
+            template_lods = ("mid", "low", "xlo") if self.lod == "xlo" else ("mid",)
+            template_lod_rigs = load_lod_rigs_from_usd(template_rig_path, template_lods)
+            template_mid_rig_data = template_lod_rigs["mid"]
             public_mid_rig_data = derive_soma_rig_without_procedural_joints(
                 template_mid_rig_data,
                 public_joint_names,
@@ -617,8 +635,8 @@ class SOMALayer(nn.Module):
                     "v0026 minimal USD into the assets directory under the "
                     "canonical SOMA template filename."
                 )
-            xlo_skeleton_lod_rig_data = load_lod_rig_from_usd(xlo_usd_rig, "low")
-            xlo_rig_data = load_lod_rig_from_usd(xlo_usd_rig, "xlo")
+            xlo_skeleton_lod_rig_data = template_lod_rigs["low"]
+            xlo_rig_data = template_lod_rigs["xlo"]
             xlo_skeleton_transfer_rig_data = xlo_skeleton_lod_rig_data
             if not self.procedural_transforms_enabled:
                 xlo_skeleton_lod_rig_data = derive_soma_rig_without_procedural_joints(
@@ -675,6 +693,11 @@ class SOMALayer(nn.Module):
         skeleton_transfer_skinning_weights = skeleton_skinning_weights
         self.identity_lod_transfer = None
         self.xlo_skeleton_transfer = None
+        identity_uses_low_lod = self.lod == "low"
+        identity_lod_mid_to_low = None
+        identity_lod_faces = None
+        identity_vertex_ids_to_exclude = None
+        correctives_vertex_index_map = None
         xlo_skeleton_joint_parent_ids = None
         xlo_skeleton_bind_pose_world = None
         xlo_skeleton_excluded_vert_ids = None
@@ -695,6 +718,10 @@ class SOMALayer(nn.Module):
             skeleton_transfer_bind_shape = skeleton_bind_shape[nv_lod_mid_to_low]
             skeleton_transfer_skinning_weights = skeleton_skinning_weights[nv_lod_mid_to_low]
             self.register_buffer("xlo_skeleton_mid_to_low", None, persistent=False)
+            identity_uses_low_lod = True
+            identity_lod_mid_to_low = self.nv_lod_mid_to_low
+            identity_lod_faces = self.faces
+            correctives_vertex_index_map = self.nv_lod_mid_to_low
         elif self.lod == "xlo":
             nv_lod_mid_to_low = self._mid_rig_data["lod_mid_to_low"]
             self.register_buffer(
@@ -715,13 +742,6 @@ class SOMALayer(nn.Module):
             self.register_buffer("bind_shape", bind_shape.to(device), persistent=False)
             self.nv_lod_mid_to_low = None
 
-            mid_bind = torch.from_numpy(self._mid_rig_data["bind_shape"]).float().to(device)
-            mid_faces = torch.from_numpy(self._mid_rig_data["triangles"]).long().to(device)
-            self.identity_lod_transfer = BarycentricInterpolator(
-                mid_bind,
-                mid_faces,
-                bind_shape.float(),
-            )
             xlo_transfer_skinning_weights = _dense_skinning_weights(xlo_skeleton_transfer_rig_data)
             xlo_skeleton_transfer_bind_shape = torch.from_numpy(
                 xlo_skeleton_transfer_rig_data["bind_shape"]
@@ -735,6 +755,28 @@ class SOMALayer(nn.Module):
             xlo_skeleton_bind_pose_world = torch.from_numpy(
                 xlo_skeleton_transfer_rig_data["bind_pose_world"]
             ).to(device)
+            if (
+                "face_vert_indices" not in xlo_skeleton_transfer_rig_data
+                or "face_vert_counts" not in xlo_skeleton_transfer_rig_data
+            ):
+                raise RuntimeError(
+                    f"Low LOD asset in '{SOMA_XLO_TEMPLATE_RIG_FILENAME}' does not contain "
+                    "mesh face topology required for XLO identity transfer."
+                )
+            faces_low = fan_triangulate(
+                xlo_skeleton_transfer_rig_data["face_vert_indices"],
+                xlo_skeleton_transfer_rig_data["face_vert_counts"],
+            )
+            low_faces = torch.from_numpy(faces_low).long().to(device)
+            self.identity_lod_transfer = BarycentricInterpolator(
+                xlo_skeleton_transfer_bind_shape.float(),
+                low_faces,
+                bind_shape.float(),
+            )
+            identity_uses_low_lod = True
+            identity_lod_mid_to_low = self.xlo_skeleton_mid_to_low
+            identity_lod_faces = low_faces
+            correctives_vertex_index_map = self.xlo_skeleton_mid_to_low
         else:
             self.register_buffer(
                 "faces", torch.from_numpy(self.rig_data["triangles"]).to(device), persistent=False
@@ -749,7 +791,6 @@ class SOMALayer(nn.Module):
                 self._mid_rig_data["segment_mouth_bag"],
             ]
         )
-        # Identity backends generate mid-SOMA shapes for xlo before the final LOD transfer.
         identity_vertex_ids_to_exclude = torch.from_numpy(facial_inner_geometry_np).to(device)
 
         if self.lod == "low":
@@ -779,6 +820,7 @@ class SOMALayer(nn.Module):
                 torch.from_numpy(facial_inner_geometry_np).long().to(device)
             ]
             xlo_skeleton_excluded_vert_ids = facial_low[facial_low >= 0]
+            identity_vertex_ids_to_exclude = xlo_skeleton_excluded_vert_ids
         else:
             facial_inner_geometry = torch.from_numpy(facial_inner_geometry_np).to(device)
 
@@ -910,14 +952,16 @@ class SOMALayer(nn.Module):
         # Backward-compatible alias
         self.facial_inner_geometry = self.excluded_vert_ids
 
-        self.skeleton_transfer = SkeletonTransfer(
-            torch.from_numpy(skeleton_rig_data["joint_parent_ids"]).to(device),
-            torch.from_numpy(skeleton_rig_data["bind_pose_world"]).to(device),
-            skeleton_transfer_bind_shape,
-            torch.from_numpy(skeleton_transfer_skinning_weights).to(device),
-            rotation_method="auto",
-            vertex_ids_to_exclude=self.facial_inner_geometry,
-        )
+        self.skeleton_transfer = None
+        if self.lod != "xlo":
+            self.skeleton_transfer = SkeletonTransfer(
+                torch.from_numpy(skeleton_rig_data["joint_parent_ids"]).to(device),
+                torch.from_numpy(skeleton_rig_data["bind_pose_world"]).to(device),
+                skeleton_transfer_bind_shape,
+                torch.from_numpy(skeleton_transfer_skinning_weights).to(device),
+                rotation_method="auto",
+                vertex_ids_to_exclude=self.facial_inner_geometry,
+            )
         if self.lod == "xlo":
             self.xlo_skeleton_transfer = SkeletonTransfer(
                 xlo_skeleton_joint_parent_ids,
@@ -927,6 +971,7 @@ class SOMALayer(nn.Module):
                 rotation_method="auto",
                 vertex_ids_to_exclude=xlo_skeleton_excluded_vert_ids,
             )
+            self.skeleton_transfer = self.xlo_skeleton_transfer
 
         source_fk = None
         if self.procedural_transforms is not None:
@@ -944,15 +989,16 @@ class SOMALayer(nn.Module):
             mode=self.mode,
             source_fk=source_fk,
         )
+        self.public_batched_skinning = self._make_public_batched_skinning()
 
         self.identity_model = create_identity_model(
             identity_model_type,
             data_root,
-            self.lod == "low",
+            identity_uses_low_lod,
             device,
             output_unit=output_unit,
-            nv_lod_mid_to_low=self.nv_lod_mid_to_low if self.lod == "low" else None,
-            soma_low_lod_faces=self.faces if self.lod == "low" else None,
+            nv_lod_mid_to_low=identity_lod_mid_to_low,
+            soma_low_lod_faces=identity_lod_faces,
             vertex_ids_to_exclude=identity_vertex_ids_to_exclude,
             **self.identity_model_kwargs,
         )
@@ -969,11 +1015,11 @@ class SOMALayer(nn.Module):
             self.num_scale_params = self.identity_model.num_scale_params
 
         self.correctives_model = None
-        if load_correctives_model:
+        if self.correctives_model_path is not None:
             self.correctives_model = CorrectivesMLP.load_checkpoint(
-                self.data_root / "correctives_model.pt",
+                self.correctives_model_path,
                 map_location=device,
-                v_index_map=self.nv_lod_mid_to_low if self.lod == "low" else None,
+                v_index_map=correctives_vertex_index_map,
                 output_unit=output_unit,
             )
         self._corrective_config = {"first_joint_index": 0, "input_type": "tfm"}
@@ -1066,6 +1112,20 @@ class SOMALayer(nn.Module):
             skinning_weights=self.public_skinning_weights(),
         )
 
+    def _make_public_batched_skinning(self) -> BatchedSkinning | None:
+        if self.procedural_transforms is None:
+            return None
+        public_indices = self.public_transform_joint_indices.to(self.bind_pose_world.device)
+        return BatchedSkinning(
+            self.public_joint_parent_ids,
+            self.public_skinning_weights(),
+            self.bind_pose_world[public_indices],
+            self.bind_shape,
+            joint_orient=self.t_pose_world[public_indices],
+            mode=self.mode,
+            global_translation_joint_idx=self.root_joint_idx,
+        )
+
     def to_public_rotations(
         self, rotations: torch.Tensor | np.ndarray
     ) -> torch.Tensor | np.ndarray:
@@ -1119,6 +1179,7 @@ class SOMALayer(nn.Module):
             mode=self.mode,
             source_fk=source_fk,
         )
+        self.public_batched_skinning = self._make_public_batched_skinning()
         # _t_pose_orient / _t_pose_orient_parent_T are plain attributes (not buffers).
         # Recompute them on the new device.
         if self.t_pose_world is not None:
@@ -1175,6 +1236,25 @@ class SOMALayer(nn.Module):
         )
         target_bind[:, self.public_transform_joint_indices] = public_bind_transforms
         return self.procedural_transforms(target_world_transforms=target_bind).transforms
+
+    def _repose_public_bind_pose(
+        self,
+        public_bind_transforms: torch.Tensor,
+        rest_shape: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Repose through the public rig before expanding procedural twist helpers."""
+        if self.public_batched_skinning is None:
+            raise RuntimeError("Public bind-pose reposing requires procedural transforms.")
+        public_indices = self.public_transform_joint_indices.to(self.bind_pose_local.device)
+        public_bind_pose_local = self.bind_pose_local[public_indices]
+        self.public_batched_skinning.rebind(public_bind_transforms, rest_shape)
+        return self.public_batched_skinning.pose(
+            local_rotations=public_bind_pose_local[..., :3, :3],
+            global_translation=public_bind_pose_local[..., self.root_joint_idx, :3, 3],
+            align_translation=torch.tensor([0, 0, 0], device=self.device),
+            return_transforms=True,
+            absolute_pose=True,
+        )
 
     @classmethod
     def _is_body_bone_scale_joint(cls, name: str) -> bool:
@@ -1320,32 +1400,43 @@ class SOMALayer(nn.Module):
         skeleton_rest_shape = self._cached_rest_shape
         skeleton_transfer = self.skeleton_transfer
         if self.lod == "xlo":
-            skeleton_rest_shape = self._cached_identity_rest_shape[:, self.xlo_skeleton_mid_to_low]
+            skeleton_rest_shape = self._cached_identity_rest_shape
             skeleton_transfer = self.xlo_skeleton_transfer
         self._cached_bind_transforms_world = self._expand_public_bind_transforms(
             skeleton_transfer.fit(skeleton_rest_shape)
         )
         if repose_to_bind_pose:
-            self.batched_skinning.rebind(
-                self._cached_bind_transforms_world,
-                self._cached_rest_shape,
-            )
-            self._cached_rest_shape, self._cached_bind_transforms_world = (
-                self.batched_skinning.pose(
-                    local_rotations=self.bind_pose_local[..., :3, :3],
-                    global_translation=self.bind_pose_local[..., 1, :3, 3],
-                    align_translation=torch.tensor([0, 0, 0], device=self.device),
-                    return_transforms=True,
-                    absolute_pose=True,
-                )
-            )
-            self._cached_bind_transforms_world = self._pin_virtual_root_to_origin(
-                self._cached_bind_transforms_world
-            )
             if self.procedural_transforms is not None:
-                self._cached_bind_transforms_world = self.procedural_transforms(
-                    target_world_transforms=self._cached_bind_transforms_world
-                ).transforms
+                public_bind_transforms = self.public_bind_transforms_world(
+                    self._cached_bind_transforms_world
+                )
+                self._cached_rest_shape, public_bind_transforms = (
+                    self._repose_public_bind_pose(
+                        public_bind_transforms,
+                        self._cached_rest_shape,
+                    )
+                )
+                public_bind_transforms = self._pin_virtual_root_to_origin(public_bind_transforms)
+                self._cached_bind_transforms_world = self._expand_public_bind_transforms(
+                    public_bind_transforms
+                )
+            else:
+                self.batched_skinning.rebind(
+                    self._cached_bind_transforms_world,
+                    self._cached_rest_shape,
+                )
+                self._cached_rest_shape, self._cached_bind_transforms_world = (
+                    self.batched_skinning.pose(
+                        local_rotations=self.bind_pose_local[..., :3, :3],
+                        global_translation=self.bind_pose_local[..., 1, :3, 3],
+                        align_translation=torch.tensor([0, 0, 0], device=self.device),
+                        return_transforms=True,
+                        absolute_pose=True,
+                    )
+                )
+                self._cached_bind_transforms_world = self._pin_virtual_root_to_origin(
+                    self._cached_bind_transforms_world
+                )
         self.batched_skinning.rebind(self._cached_bind_transforms_world, self._cached_rest_shape)
         self._cached_scale_params = scale_params if self.identity_model_type == "soma" else None
         self._cached_global_scale = global_scale
@@ -1423,8 +1514,18 @@ class SOMALayer(nn.Module):
             )
         )
 
-        # Correctives are per-vertex offsets to rest_shape — only needed when LBS runs.
-        if apply_correctives and not fk_only and self.correctives_model is not None:
+        # Correctives are per-vertex offsets to rest_shape -- only needed when LBS runs.
+        if apply_correctives and not fk_only:
+            if self.procedural_transforms is None:
+                raise RuntimeError(
+                    "SOMALayer correctives require procedural transforms; construct with "
+                    "enable_procedural_transforms=True or pass apply_correctives=False."
+                )
+            if self.correctives_model is None:
+                raise RuntimeError(
+                    "apply_correctives=True but no corrective model is loaded. Construct with "
+                    "a valid correctives_model_path or pass apply_correctives=False."
+                )
             correctives_input = public_absolute_rotations
             out_correctives = self.correctives_model(correctives_input)["out"]
             gs = self._cached_global_scale

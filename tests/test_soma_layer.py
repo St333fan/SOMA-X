@@ -266,6 +266,7 @@ def test_soma_layer_xlo_uses_low_lod_skeleton_transfer(data_root):
 
     assert xlo_layer.xlo_skeleton_transfer is not None
     assert xlo_layer.xlo_skeleton_mid_to_low is not None
+    assert xlo_layer.skeleton_transfer is xlo_layer.xlo_skeleton_transfer
     assert xlo_layer.bind_shape.shape[0] != xlo_layer.xlo_skeleton_transfer.bind_shape.shape[0]
 
     fit_call = {}
@@ -275,11 +276,7 @@ def test_soma_layer_xlo_uses_low_lod_skeleton_transfer(data_root):
         fit_call["shape"] = rest_shape.shape
         return original_xlo_fit(rest_shape)
 
-    def fail_sparse_xlo_fit(_rest_shape):
-        raise AssertionError("xlo mesh vertices should not drive skeleton fitting")
-
     xlo_layer.xlo_skeleton_transfer.fit = record_xlo_skeleton_fit
-    xlo_layer.skeleton_transfer.fit = fail_sparse_xlo_fit
 
     identity_coeffs = torch.zeros(1, xlo_layer.identity_model.num_identity_coeffs)
     with torch.no_grad():
@@ -342,10 +339,14 @@ def test_soma_layer_forward(data_root, identity_model_type, device, lod, apply_c
         assert layer.nv_lod_mid_to_low is not None
         expected_num_verts = layer.nv_lod_mid_to_low.shape[0]
         assert layer.bind_shape.shape[0] == expected_num_verts
+        if layer.correctives_model is not None:
+            assert layer.correctives_model.module.V == expected_num_verts
     elif lod == "xlo":
         assert layer.nv_lod_mid_to_low is None
         assert layer.identity_lod_transfer is not None
         assert layer.xlo_skeleton_transfer is not None
+        if layer.correctives_model is not None:
+            assert layer.correctives_model.module.V == layer.xlo_skeleton_mid_to_low.shape[0]
         expected_num_verts = layer.bind_shape.shape[0]
 
     batch_size = 1
@@ -390,7 +391,7 @@ def test_soma_layer_can_skip_correctives_model_for_pure_lbs(data_root):
             device="cpu",
             identity_model_type="soma",
             mode="dense",
-            load_correctives_model=False,
+            correctives_model_path=None,
         )
     except (FileNotFoundError, ImportError) as e:
         pytest.skip(f"Missing asset or dependency: {e}")
@@ -410,6 +411,144 @@ def test_soma_layer_can_skip_correctives_model_for_pure_lbs(data_root):
 
     assert "vertices" in out
     assert out["vertices"].shape[1] == layer.bind_shape.shape[0]
+
+
+@pytest.mark.cpu
+@pytest.mark.asset_heavy
+def test_soma_layer_deprecated_load_correctives_model_false_alias(data_root):
+    """Legacy callers can still disable checkpoint loading through the old flag."""
+    from soma import SOMALayer
+
+    try:
+        with pytest.warns(DeprecationWarning, match="load_correctives_model is deprecated"):
+            layer = SOMALayer(
+                data_root=data_root,
+                lod="low",
+                device="cpu",
+                identity_model_type="soma",
+                mode="dense",
+                load_correctives_model=False,
+            )
+    except (FileNotFoundError, ImportError) as e:
+        pytest.skip(f"Missing asset or dependency: {e}")
+
+    assert layer.correctives_model_path is None
+    assert layer.correctives_model is None
+
+
+@pytest.mark.cpu
+@pytest.mark.asset_heavy
+def test_soma_layer_accepts_custom_correctives_model_path(data_root):
+    """Callers can load a corrective checkpoint outside the default resolver."""
+    from soma import SOMALayer
+
+    correctives_path = Path(data_root) / "correctives_model.pt"
+    if not correctives_path.is_file():
+        pytest.skip("Corrective model not available")
+
+    try:
+        layer = SOMALayer(
+            data_root=data_root,
+            lod="low",
+            device="cpu",
+            identity_model_type="soma",
+            mode="dense",
+            correctives_model_path=correctives_path,
+        )
+    except (FileNotFoundError, ImportError) as e:
+        pytest.skip(f"Missing asset or dependency: {e}")
+
+    assert layer.correctives_model_path == correctives_path
+    assert layer.correctives_model is not None
+
+
+@pytest.mark.cpu
+@pytest.mark.asset_heavy
+def test_soma_layer_missing_custom_correctives_model_path_raises(data_root, tmp_path):
+    from soma import SOMALayer
+
+    with pytest.raises(FileNotFoundError, match="Correctives model checkpoint not found"):
+        SOMALayer(
+            data_root=data_root,
+            lod="low",
+            device="cpu",
+            identity_model_type="soma",
+            mode="dense",
+            correctives_model_path=tmp_path / "missing_correctives.pt",
+        )
+
+
+@pytest.mark.cpu
+@pytest.mark.asset_heavy
+def test_soma_layer_rejects_correctives_flag_and_explicit_path(data_root):
+    from soma import SOMALayer
+
+    correctives_path = Path(data_root) / "correctives_model.pt"
+    if not correctives_path.is_file():
+        pytest.skip("Corrective model not available")
+
+    with pytest.warns(DeprecationWarning, match="load_correctives_model is deprecated"):
+        with pytest.raises(ValueError, match="explicit correctives_model_path"):
+            SOMALayer(
+                data_root=data_root,
+                lod="low",
+                device="cpu",
+                identity_model_type="soma",
+                mode="dense",
+                correctives_model_path=correctives_path,
+                load_correctives_model=False,
+            )
+
+
+@pytest.mark.cpu
+@pytest.mark.asset_heavy
+def test_soma_layer_correctives_require_procedural_transforms(data_root):
+    from soma import SOMALayer
+
+    correctives_path = Path(data_root) / "correctives_model.pt"
+    if not correctives_path.is_file():
+        pytest.skip("Corrective model not available")
+
+    with pytest.raises(ValueError, match="Correctives require procedural transforms"):
+        SOMALayer(
+            data_root=data_root,
+            lod="low",
+            device="cpu",
+            identity_model_type="soma",
+            mode="dense",
+            enable_procedural_transforms=False,
+            correctives_model_path=correctives_path,
+        )
+
+
+@pytest.mark.cpu
+@pytest.mark.asset_heavy
+def test_soma_layer_apply_correctives_requires_loaded_model(data_root):
+    from soma import SOMALayer
+
+    try:
+        layer = SOMALayer(
+            data_root=data_root,
+            lod="low",
+            device="cpu",
+            identity_model_type="soma",
+            mode="dense",
+            correctives_model_path=None,
+        )
+    except (FileNotFoundError, ImportError) as e:
+        pytest.skip(f"Missing asset or dependency: {e}")
+
+    poses = torch.eye(3).reshape(1, 1, 3, 3).expand(1, 77, 3, 3).contiguous()
+    identity_coeffs = torch.zeros(1, layer.num_shape_components)
+
+    with pytest.raises(RuntimeError, match="no corrective model is loaded"):
+        with torch.no_grad():
+            layer(
+                poses,
+                identity_coeffs,
+                pose2rot=False,
+                apply_correctives=True,
+            )
 
 
 @pytest.mark.parametrize(("device", "mode"), _SOMA_FK_ONLY_CASES)
