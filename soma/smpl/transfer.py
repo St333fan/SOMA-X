@@ -98,8 +98,30 @@ def _layer_identity_coeffs(
     return coeffs
 
 
-def _adapt_identity_coeffs(values: torch.Tensor, target_layer: Any) -> torch.Tensor:
-    return _layer_identity_coeffs(target_layer, values)
+def _adapt_identity_coeffs(
+    values: torch.Tensor,
+    source_layer: Any,
+    target_layer: Any,
+) -> torch.Tensor:
+    """Reuse coefficients only when source and target share an identity space.
+
+    SOMA/MHR identity coefficients are not SMPL-family betas.  Truncating the
+    former and passing them to SMPL/SMPL-X can create severely distorted body,
+    head, and foot shapes.  Cross-family transfers therefore start from the
+    target model's neutral identity unless target coefficients are supplied
+    explicitly by the caller.
+    """
+    source_family = getattr(source_layer, "topology_family", None)
+    target_family = getattr(target_layer, "topology_family", None)
+    source_spec = getattr(source_layer, "model_spec", None)
+    target_spec = getattr(target_layer, "model_spec", None)
+    compatible = source_family is not None and source_family == target_family
+    compatible = compatible or (
+        source_spec in {"smpl", "smplx"} and target_spec in {"smpl", "smplx"}
+    )
+    if compatible:
+        return _layer_identity_coeffs(target_layer, values)
+    return _layer_identity_coeffs(target_layer, None)
 
 
 def _pose_batch_size(poses: torch.Tensor, pose2rot: bool) -> int:
@@ -283,7 +305,7 @@ def transfer_smpl_family_pose_parameters(
         batch_size=None,
     )
     if target_identity_coeffs is None:
-        target_identity = _adapt_identity_coeffs(source_identity, target_layer)
+        target_identity = _adapt_identity_coeffs(source_identity, source_layer, target_layer)
     else:
         target_identity = _layer_identity_coeffs(target_layer, target_identity_coeffs)
 
